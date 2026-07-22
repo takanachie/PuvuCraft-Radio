@@ -1,0 +1,149 @@
+version: 1
+
+app:
+  name: "PuvuCraft Radio"
+  environment: "development"
+  timezone: "Asia/Shanghai"
+  public_base_url: "http://127.0.0.1:8000"
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+  workers: 1
+  proxy_headers: true
+  trusted_proxies:
+    - "127.0.0.1"
+    - "::1"
+
+paths:
+  data_dir: "./data"
+  media_dir: "./data/media"
+  upload_temp_dir: "./data/tmp/uploads"
+  cover_dir: "./data/covers"
+  hls_dir: "./data/runtime/hls"
+  log_dir: "./data/logs"
+  bootstrap_token_file: "./data/bootstrap.token"
+
+database:
+  url: "sqlite:///./data/radio.db"
+  sqlite_wal: true
+  busy_timeout_ms: 5000
+
+auth:
+  secret_key: "${RADIO_SECRET_KEY}"
+  password_hash: "argon2id"
+  registration:
+    enabled: true
+    require_approval: true
+    require_email: true
+    require_email_verification: false
+  password_policy:
+    min_length: 10
+    max_length: 128
+  session:
+    cookie_name: "radio_session"
+    ttl_hours: 168
+    idle_timeout_hours: 24
+    secure_cookie: false # Production HTTPS deployments must set this to true.
+    same_site: "lax"
+  csrf:
+    enabled: true
+    cookie_name: "radio_csrf"
+    header_name: "X-CSRF-Token"
+  rate_limits:
+    login_per_minute: 10
+    register_per_hour: 5
+    setup_per_minute: 5
+
+bootstrap:
+  mode: "first_visit"
+  require_one_time_token: true
+
+media:
+  max_upload_bytes: 524288000
+  allowed_extensions:
+    - ".mp3"
+    - ".flac"
+    - ".m4a"
+    - ".aac"
+    - ".wav"
+    - ".ogg"
+  import_directories:
+    - "./data/import"
+  deduplicate_by: "sha256"
+  duplicate_policy: "reuse"
+  missing_file_policy: "mark_unavailable"
+  metadata:
+    extract_tags: true
+    extract_embedded_cover: true
+    allow_admin_edit: true
+
+ffmpeg:
+  binary: "/usr/bin/ffmpeg"
+  ffprobe_binary: "/usr/bin/ffprobe"
+  log_level: "warning"
+  restart:
+    initial_delay_seconds: 1
+    max_delay_seconds: 30
+    max_failures_before_offline: 10
+
+streaming:
+  always_on: true
+  require_authenticated_session: true
+  output:
+    codec: "aac"
+    profile: "aac_low"
+    bitrate: "192k"
+    sample_rate: 48000
+    channels: 2
+  hls:
+    segment_container: "mpegts"
+    segment_duration_seconds: 4
+    playlist_segments: 6
+    delete_old_segments: true
+    delete_threshold: 2
+  playback:
+    default_mode: "sequential"
+    allowed_modes:
+      - "sequential"
+      - "shuffle"
+    loop: true
+    transition: "direct"
+    recovery: "timeline"
+    state_checkpoint_seconds: 5
+  process_control:
+    shutdown_timeout_seconds: 10
+    stale_output_cleanup: true
+
+stream_access:
+  nginx_auth_request_path: "/api/internal/stream-auth"
+  authorization_cache_seconds: 5
+  allow_anonymous: false
+
+events:
+  transport: "sse"
+  heartbeat_seconds: 15
+  playback_position_interval_seconds: 2
+
+frontend:
+  theme: "dark_radio_console"
+  default_locale: "zh-CN"
+  show_full_playlist: true
+  show_seek_control: false
+  return_to_live_on_resume: true
+
+seed:
+  channels:
+    - name: "默认频道"
+      slug: "default"
+      description: "默认音乐频道"
+      enabled: true
+      playback_mode: "sequential"
+      display_order: 1
+
+logging:
+  level: "INFO"
+  format: "json"
+  file: "./data/logs/radio.log"
+  max_bytes: 10485760
+  backup_count: 5

@@ -1,0 +1,52 @@
+# PuvuCraft Radio
+
+PuvuCraft Radio 是基于 FastAPI、Vue 3、FFmpeg 和 HLS 的多频道同步在线音乐电台。完整产品与技术约束见 [`SPEC.md`](SPEC.md)。
+
+> [!IMPORTANT]
+> 本项目主要由 AI 生成，用于个人学习和自托管使用。代码按现状提供，部署者应在公开服务前自行完成安全审查、版权确认和运行环境加固。
+
+## 当前能力
+
+- 用户注册、管理员审批、Argon2id 密码和可撤销 Cookie 会话
+- 一次性令牌保护的首次管理员网页向导
+- 频道、音乐库、歌单和播放控制后台
+- 上传及服务器目录扫描、ffprobe 验证、标签和内嵌封面提取
+- 每频道持续 HLS 编码器、同步播放时间线、切歌和重启恢复
+- Vue 3 深色电台控制台、hls.js 播放器和 SSE 状态更新
+- Nginx `auth_request`、HTTPS 和 systemd 部署模板
+
+## 开发环境
+
+需要 Python 3.12+、Node.js 22+、FFmpeg 和 ffprobe。
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+cp config.example.yaml config.yaml
+export RADIO_SECRET_KEY="$(openssl rand -hex 32)"
+.venv/bin/uvicorn backend.app.main:app --reload
+```
+
+另一个终端启动前端：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+首次启动后，从 `data/bootstrap.token` 读取一次性令牌并访问 `/setup`。成功创建管理员后，该令牌文件会自动删除。
+
+## 验证
+
+```bash
+.venv/bin/ruff check backend tests
+.venv/bin/pytest
+cd frontend && npm test && npm run build
+```
+
+本地缺少 FFmpeg 时，账号和管理 API 仍可启动，但频道会显示 `offline` 并报告 FFmpeg 不可用。
+
+## 生产部署
+
+完整生产部署步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md)，所需模板位于 `deploy/`。生产环境必须使用 HTTPS、安全 Cookie、独立服务账号，并通过 Nginx 对每个 HLS 清单和分片执行会话授权。
