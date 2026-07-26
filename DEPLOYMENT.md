@@ -13,7 +13,8 @@
 
 FastAPI -> 每个活动频道一个持续 FFmpeg HLS 编码器
         -> SQLite 数据库
-        -> 本地媒体库
+        -> 公共上传队列与 FFmpeg 规范化
+        -> 配置中的一个或多个媒体挂载
 ```
 
 固定路径：
@@ -22,12 +23,13 @@ FastAPI -> 每个活动频道一个持续 FFmpeg HLS 编码器
 | --- | --- |
 | `/opt/radio` | 应用程序与 Python 虚拟环境 |
 | `/opt/radio/config.yaml` | 生产配置 |
-| `/opt/radio/data` | SQLite、媒体、封面和运行数据 |
+| `/opt/radio/data` | SQLite、默认媒体、封面和运行数据 |
+| `/opt/radio/tmp` | 上传与规范化临时文件，不备份 |
 | `/etc/radio/radio.env` | 服务环境变量和密钥 |
 | `/etc/nginx/sites-available/radio` | Nginx 站点配置 |
 | `/etc/systemd/system/radio.service` | systemd 服务 |
 
-FastAPI 只监听 `127.0.0.1:8000`。公网只能访问 Nginx 的 80 和 443 端口。
+FastAPI 监听 `0.0.0.0:8000`，以接收域名上游或外部反向代理的连接。生产流量仍应先经过 HTTPS 反向代理；安全组或防火墙应尽可能只允许可信上游访问 8000 端口。
 
 ## 2. 部署前准备
 
@@ -35,7 +37,7 @@ FastAPI 只监听 `127.0.0.1:8000`。公网只能访问 Nginx 的 80 和 443 端
 
 - 一台 Ubuntu 24.04 服务器。
 - 指向服务器公网地址的域名，例如 `radio.example.com`。
-- 安全组或防火墙允许 TCP 80 和 443。
+- 安全组或防火墙允许 TCP 80 和 443；域名由外部上游转发时，还需允许该上游访问 TCP 8000。
 - 至少 2 个 CPU 核心；频道较多时建议 4 核以上。
 - 足够存放原始音乐、封面和备份的磁盘空间。
 - 可持续提供所有在线听众总带宽的公网带宽。
@@ -91,7 +93,7 @@ cd ..
 - `SPEC.md`
 - `DEPLOYMENT.md`
 
-不要发布 `.venv`、`node_modules`、本地 `data`、缓存或开发配置。
+不要发布 `.venv`、`node_modules`、本地 `data`、`tmp`、缓存或开发配置。
 
 将发布内容放入 `/opt/radio` 后安装 Python 环境：
 
@@ -113,11 +115,12 @@ sudo install -d -o radio -g radio -m 0750 \
   /opt/radio/data/media \
   /opt/radio/data/covers \
   /opt/radio/data/import \
-  /opt/radio/data/tmp \
-  /opt/radio/data/tmp/uploads \
   /opt/radio/data/runtime \
   /opt/radio/data/runtime/hls \
-  /opt/radio/data/logs
+  /opt/radio/data/logs \
+  /opt/radio/tmp \
+  /opt/radio/tmp/uploads \
+  /opt/radio/tmp/normalized
 ```
 
 Nginx 只需要读取 HLS 运行目录，不需要读取数据库和原始媒体库：
@@ -163,10 +166,27 @@ sudoedit /opt/radio/config.yaml
 - `app.public_base_url`：替换为实际 HTTPS 域名。
 - `app.timezone`：替换为实际显示时区。
 - `media.import_directories`：确认只包含受信任目录。
+- `uploads`：确认临时目录、10 位队列上限、并行数和心跳时限。
+- `storage.locations`：为每个媒体挂载设置稳定唯一 ID、绝对根目录、优先级和最大磁盘使用百分比。
 - `ffmpeg.binary` 和 `ffmpeg.ffprobe_binary`：确认与系统路径一致。
 - `auth.session.secure_cookie`：生产环境必须保持 `true`。
 
 配置中的相对路径按配置文件目录解析。生产示例默认使用绝对路径。
+
+应用不会代替操作系统挂载磁盘。额外磁盘应先通过 `/etc/fstab` 或等价机制挂载，再把其中的媒体根目录加入 `storage.locations`。`priority` 数值越大越优先；写入后预计磁盘占用超过 `max_usage_percent` 时，应用自动选择下一可用位置。生产配置建议保持 `create_if_missing: false`，防止挂载缺失时误写到系统盘。
+
+每个额外挂载还必须加入 systemd 的挂载依赖与写入白名单。例如：
+
+```ini
+# sudo systemctl edit radio.service
+[Unit]
+RequiresMountsFor=/mnt/radio-secondary/media
+
+[Service]
+ReadWritePaths=/mnt/radio-secondary/media
+```
+
+对应目录必须由 `radio:radio` 拥有，并在修改后执行 `sudo systemctl daemon-reload`。SQLite 中保存的是存储 ID 和相对文件名，不保存绝对路径，因此在保持 ID 不变的情况下可以调整挂载根目录。
 
 ## 7. 初始化数据库
 
@@ -222,7 +242,7 @@ sudo certbot renew --dry-run
 Nginx 会执行以下安全策略：
 
 - 所有 HLS 清单和分片都通过 FastAPI 会话授权。
-- 大型音乐和封面请求在接收请求体前验证管理员会话。
+- 大型音乐和封面请求在接收请求体前验证管理员会话；音乐请求关闭代理缓冲，以便页面关闭时立即中断上游传输。
 - 普通 API 请求体限制为 1 MiB。
 - FastAPI、SQLite 和原始媒体目录不直接暴露到公网。
 - HTTP 自动跳转到 HTTPS。
@@ -246,13 +266,13 @@ sudo tail -f /opt/radio/data/logs/radio.log
 sudo tail -f /var/log/nginx/radio.error.log
 ```
 
-确认 Uvicorn 只监听回环地址：
+确认 Uvicorn 在生产端口监听所有 IPv4 地址：
 
 ```bash
 ss -lntp | grep 8000
 ```
 
-预期地址为 `127.0.0.1:8000`，不能是 `0.0.0.0:8000`。
+预期地址为 `0.0.0.0:8000`。如果 8000 端口由外部反向代理访问，应在安全组或防火墙中限制其来源地址，避免绕过 HTTPS 入口。
 
 ## 10. 创建首个管理员
 
@@ -286,11 +306,13 @@ curl -I https://radio.example.com/hls/nonexistent.m3u8
 
 登录后应验证：
 
-1. 管理员可以上传音乐并读取自动提取的元数据。
-2. 管理员可以创建频道、维护歌单和切歌。
-3. 普通用户注册后必须等待管理员审批。
-4. 两个浏览器进入同一频道时听到相同歌曲和近似进度。
-5. 停用用户后，其 API、SSE 和后续 HLS 分片访问会失效。
+1. 两个管理员页面能看到同一公共上传队列，队列满 10 项后拒绝新预约，服务器按配置并行开始传输。
+2. 关闭持有任务的页面后，排队和传输中的任务过期，`/opt/radio/tmp` 中不留下对应文件。
+3. 上传超过 48 kHz、2 声道或 32 bit 的测试音频后，曲目显示为 FLAC 规范化且最终参数不超过推流配置。
+4. 管理员可以创建频道、维护歌单和切歌。
+5. 普通用户注册后必须等待管理员审批。
+6. 两个浏览器进入同一频道时听到相同歌曲和近似进度。
+7. 停用用户后，其 API、SSE 和后续 HLS 分片访问会失效。
 
 ## 12. 备份
 
@@ -313,10 +335,12 @@ sudo sqlite3 "/var/backups/radio/$stamp/radio.db" \
 
 完整性检查必须输出 `ok`。备份应加密并复制到服务器外部，设置保留周期并定期演练恢复。
 
+上例只备份生产示例的 `primary` 存储。配置了多个 `storage.locations` 时，必须逐一备份每个启用位置，并保留其存储 ID 与备份目录的映射，否则恢复后的 SQLite 记录无法定位媒体文件。
+
 不需要备份：
 
 - `/opt/radio/data/runtime/hls`
-- `/opt/radio/data/tmp`
+- `/opt/radio/tmp`
 - 日志缓存
 
 ## 13. 恢复
@@ -327,10 +351,11 @@ sudo sqlite3 "/var/backups/radio/$stamp/radio.db" \
 sudo systemctl stop radio.service
 ```
 
-恢复 `radio.db`、`media/` 和 `covers/`，然后执行：
+按原存储 ID 恢复 `radio.db`、每个媒体根和 `covers/`，确认所有挂载就绪，然后执行：
 
 ```bash
 sudo chown -R radio:radio /opt/radio/data
+sudo chown -R radio:radio /opt/radio/tmp
 sudo -u radio /bin/sh -c '
   set -a
   . /etc/radio/radio.env
@@ -364,10 +389,10 @@ sudo systemctl start radio.service
 ```bash
 sudo -u radio /usr/bin/ffmpeg -version
 sudo journalctl -u radio.service -n 200 --no-pager
-ls -l /opt/radio/data/media
+sudo -u radio test -w /opt/radio/data/media
 ```
 
-常见原因包括歌单为空、音乐文件不可读、FFmpeg 路径错误或磁盘已满。
+常见原因包括歌单为空、SQLite 中的存储 ID 未配置、对应挂载缺失、音乐文件不可读、FFmpeg 路径错误或磁盘达到配置上限。
 
 ### HLS 返回 401 或 403
 
@@ -375,7 +400,11 @@ ls -l /opt/radio/data/media
 
 ### 上传返回 413
 
-确认请求是否走最终 Nginx 配置。音乐上传位置允许 500 MiB 文件及 multipart 开销，其他 API 仍限制为 1 MiB。
+确认请求是否走最终 Nginx 配置。原始音乐内容接口允许 500 MiB，其他 API 仍限制为 1 MiB；预约时声明大小也不得超过 500 MiB。
+
+### 上传一直排队或返回 storage_unavailable
+
+检查公共队列是否已有 10 个未结束任务、页面心跳是否正常，以及 `storage.locations` 中是否至少有一个已挂载、服务账号可写且预计占用率未超过上限的位置。检查额外挂载是否同时出现在 systemd 的 `RequiresMountsFor` 和 `ReadWritePaths` 中。
 
 ### SQLite database is locked
 

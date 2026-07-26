@@ -17,8 +17,6 @@ server:
 
 paths:
   data_dir: "./data"
-  media_dir: "./data/media"
-  upload_temp_dir: "./data/tmp/uploads"
   cover_dir: "./data/covers"
   hls_dir: "./data/runtime/hls"
   log_dir: "./data/logs"
@@ -78,6 +76,33 @@ media:
     extract_embedded_cover: true
     allow_admin_edit: true
 
+uploads:
+  temp_dir: "./tmp"
+  queue_limit: 10
+  max_concurrent: 3
+  ready_lease_seconds: 120
+  heartbeat_interval_seconds: 5
+  heartbeat_timeout_seconds: 15
+  progress_checkpoint_bytes: 4194304
+  history_limit: 100
+
+storage:
+  locations:
+    - id: "primary"
+      root: "./data/media"
+      priority: 100
+      max_usage_percent: 90
+      enabled: true
+      create_if_missing: true
+    # Add more mounted locations with unique IDs. Higher priority wins while
+    # projected disk use remains at or below max_usage_percent.
+    # - id: "secondary"
+    #   root: "/mnt/radio-secondary/media"
+    #   priority: 50
+    #   max_usage_percent: 85
+    #   enabled: true
+    #   create_if_missing: false
+
 ffmpeg:
   binary: "/usr/bin/ffmpeg"
   ffprobe_binary: "/usr/bin/ffprobe"
@@ -96,6 +121,7 @@ streaming:
     bitrate: "192k"
     sample_rate: 48000
     channels: 2
+    sample_bits: 32
   hls:
     segment_container: "mpegts"
     segment_duration_seconds: 4

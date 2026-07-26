@@ -5,7 +5,7 @@ Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/opt/radio/config.yaml
 ConditionPathExists=/opt/radio/.venv/bin/python
-RequiresMountsFor=/opt/radio/data
+RequiresMountsFor=/opt/radio/data /opt/radio/tmp
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -15,7 +15,7 @@ User=radio
 Group=radio
 WorkingDirectory=/opt/radio
 EnvironmentFile=/etc/radio/radio.env
-ExecStart=/opt/radio/.venv/bin/python -m uvicorn ${RADIO_ASGI_APP} --app-dir=/opt/radio --host=127.0.0.1 --port=8000 --workers=1 --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-server-header --no-access-log
+ExecStart=/opt/radio/.venv/bin/python -m uvicorn ${RADIO_ASGI_APP} --app-dir=/opt/radio --host=0.0.0.0 --port=8000 --workers=1 --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-server-header --no-access-log
 
 Restart=on-failure
 RestartSec=5s
@@ -47,7 +47,7 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectProc=invisible
 ProcSubset=pid
-ReadWritePaths=/opt/radio/data
+ReadWritePaths=/opt/radio/data /opt/radio/tmp
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictRealtime=true

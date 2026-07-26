@@ -34,8 +34,8 @@ from ..schemas import (
 )
 from ..security import AuthService
 from ..serializers import channel_dict, playlist_item_dict, track_dict, user_dict
-from ..services.media import MediaService
 from ..services.playback import ChannelCommand
+from ..services.storage import StorageUnavailable
 
 router = APIRouter(prefix="/api/admin")
 logger = logging.getLogger(__name__)
@@ -257,29 +257,6 @@ def list_tracks(
     return [_track_with_references(track) for track in tracks]
 
 
-@router.post("/tracks/upload", status_code=201)
-def upload_track(
-    file: UploadFile,
-    request: Request,
-    admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
-) -> dict[str, object]:
-    filename = Path(file.filename or "").name
-    if not filename:
-        raise ApiError(422, "missing_filename", "上传文件缺少名称")
-    media: MediaService = request.app.state.media
-    staged = media.stage_upload(file.file, filename)
-    track, duplicate = media.import_staged(db, staged, filename)
-    audit(db, admin, "track.uploaded", "track", track.id, {"duplicate": duplicate})
-    db.commit()
-    return {
-        "track": _track_with_references(track),
-        "duplicates": [_track_with_references(track)] if duplicate else [],
-        "imported": 0 if duplicate else 1,
-        "skipped": 1 if duplicate else 0,
-    }
-
-
 @router.post("/tracks/scan")
 def scan_tracks(
     request: Request,
@@ -393,6 +370,7 @@ def upload_track_cover(
 @router.delete("/tracks/{track_id}", status_code=204)
 def delete_track(
     track_id: int,
+    request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
@@ -404,12 +382,16 @@ def delete_track(
         raise ApiError(404, "track_not_found", "歌曲不存在")
     if track.playlist_items:
         raise ApiError(409, "track_in_use", "歌曲仍被频道歌单引用，请先从歌单移除")
-    media_path = settings.paths.media_dir / track.storage_name
+    try:
+        media_path = request.app.state.storage.track_path(track)
+    except StorageUnavailable:
+        media_path = None
     cover_path = settings.paths.cover_dir / track.cover_name if track.cover_name else None
     db.delete(track)
     audit(db, admin, "track.deleted", "track", track.id, {"filename": track.original_filename})
     db.commit()
-    unlink_after_commit(media_path)
+    if media_path:
+        unlink_after_commit(media_path)
     if cover_path:
         unlink_after_commit(cover_path)
 

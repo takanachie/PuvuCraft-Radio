@@ -12,7 +12,8 @@ import type {
   SetupStatus,
   Track,
   TrackInput,
-  UploadResponse,
+  UploadJob,
+  UploadQueueSnapshot,
   User,
   UserStatus,
   CredentialsPayload,
@@ -100,14 +101,30 @@ export const api = {
     async tracks(): Promise<Track[]> {
       return unwrapList<Track>(await request<unknown>('/api/admin/tracks'), ['tracks'])
     },
-    async uploadTrack(file: File): Promise<UploadResponse | undefined> {
-      const form = new FormData()
-      form.append('file', file, file.name)
-      const payload = await request<unknown>('/api/admin/tracks/upload', {
+    async uploadQueue(): Promise<UploadQueueSnapshot> {
+      return request<UploadQueueSnapshot>('/api/admin/uploads')
+    },
+    async reserveUpload(clientId: string, file: File): Promise<UploadJob> {
+      const payload = await request<unknown>('/api/admin/uploads', {
         method: 'POST',
-        body: form,
+        json: {
+          client_id: clientId,
+          filename: file.name,
+          size_bytes: file.size,
+        },
       })
-      return unwrapEntity<UploadResponse | undefined>(payload)
+      return unwrapEntity<UploadJob>(payload, ['job'])
+    },
+    async heartbeatUploads(clientId: string): Promise<void> {
+      await request('/api/admin/uploads/heartbeat', {
+        method: 'POST',
+        json: { client_id: clientId },
+      })
+    },
+    async cancelUpload(jobId: string): Promise<void> {
+      await request(`/api/admin/uploads/${encodeURIComponent(jobId)}`, {
+        method: 'DELETE',
+      })
     },
     async scanTracks(): Promise<ScanResponse | undefined> {
       const payload = await request<unknown>('/api/admin/tracks/scan', {

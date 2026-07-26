@@ -8,9 +8,9 @@ const props = defineProps<{
 
 const normalized = computed(() => (props.status || 'unknown').toLowerCase())
 const tone = computed(() => {
-  if (['live', 'approved', 'enabled', 'available', 'online'].includes(normalized.value)) return 'good'
-  if (['starting', 'pending', 'pending_approval', 'degraded'].includes(normalized.value)) return 'warn'
-  if (['offline', 'rejected', 'disabled', 'error', 'unavailable'].includes(normalized.value)) return 'bad'
+  if (['live', 'approved', 'enabled', 'available', 'online', 'completed'].includes(normalized.value)) return 'good'
+  if (['starting', 'pending', 'pending_approval', 'degraded', 'queued', 'ready', 'uploading', 'verifying', 'normalizing', 'placing'].includes(normalized.value)) return 'warn'
+  if (['offline', 'rejected', 'disabled', 'error', 'unavailable', 'failed', 'cancelled', 'expired'].includes(normalized.value)) return 'bad'
   return 'neutral'
 })
 
@@ -29,6 +29,16 @@ const display = computed(() => {
     disabled: '已停用',
     available: '可用',
     unavailable: '不可用',
+    queued: '排队中',
+    ready: '等待传输',
+    uploading: '上传中',
+    verifying: '校验中',
+    normalizing: '规范化',
+    placing: '迁移中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+    expired: '已过期',
   }
   return labels[normalized.value] || props.status || '未知'
 })

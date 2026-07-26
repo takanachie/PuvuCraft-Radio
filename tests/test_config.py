@@ -40,6 +40,20 @@ def test_seed_channel_slug_cannot_escape_hls_root(settings: Settings) -> None:
         Settings.model_validate(payload)
 
 
+def test_upload_queue_limit_is_fixed_at_ten(settings: Settings) -> None:
+    payload = settings.model_dump()
+    payload["uploads"]["queue_limit"] = 11
+    with pytest.raises(ValidationError):
+        Settings.model_validate(payload)
+
+
+def test_storage_location_ids_must_be_unique(settings: Settings) -> None:
+    payload = settings.model_dump()
+    payload["storage"]["locations"].append(payload["storage"]["locations"][0].copy())
+    with pytest.raises(ValidationError):
+        Settings.model_validate(payload)
+
+
 def test_production_startup_refuses_an_unmigrated_database(settings: Settings) -> None:
     settings.app.environment = "production"
     settings.app.public_base_url = "https://radio.example.com"

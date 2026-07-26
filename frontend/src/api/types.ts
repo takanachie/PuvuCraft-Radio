@@ -3,6 +3,17 @@ export type UserRole = 'admin' | 'listener'
 export type UserStatus = 'pending' | 'approved' | 'rejected' | 'disabled'
 export type PlaybackMode = 'sequential' | 'shuffle'
 export type ChannelState = 'starting' | 'live' | 'degraded' | 'offline' | 'stopped'
+export type UploadJobStatus =
+  | 'queued'
+  | 'ready'
+  | 'uploading'
+  | 'verifying'
+  | 'normalizing'
+  | 'placing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'expired'
 
 export interface SetupStatus {
   required: boolean
@@ -59,6 +70,11 @@ export interface Track extends TrackSummary {
   file_size_bytes?: number | null
   sha256?: string | null
   mime_type?: string | null
+  sample_rate?: number | null
+  channels?: number | null
+  bits_per_sample?: number | null
+  normalized?: boolean
+  storage_id?: string | null
   created_at?: string
   updated_at?: string
   unavailable_reason?: string | null
@@ -174,6 +190,42 @@ export interface UploadResponse {
   skipped?: number
   imported?: number
   message?: string
+}
+
+export interface UploadJob {
+  id: string
+  owner: {
+    id: EntityId
+    username: string
+  }
+  client_id: string
+  original_filename: string
+  declared_size_bytes: number
+  bytes_received: number
+  status: UploadJobStatus
+  queue_position: number | null
+  storage_id: string | null
+  storage_name: string | null
+  sha256: string | null
+  track_id: EntityId | null
+  duplicate: boolean
+  error_code: string | null
+  error_message: string | null
+  ready_at: string | null
+  lease_expires_at: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface UploadQueueSnapshot {
+  jobs: UploadJob[]
+  queue_limit: number
+  max_concurrent: number
+  active_count: number
+  available_slots: number
+  heartbeat_interval_seconds: number
 }
 
 export interface ScanResponse extends UploadResponse {

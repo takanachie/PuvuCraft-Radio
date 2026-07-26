@@ -92,6 +92,7 @@ class Track(Base):
     __tablename__ = "tracks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    storage_id: Mapped[str] = mapped_column(String(80), default="primary", index=True)
     storage_name: Mapped[str] = mapped_column(String(255), unique=True)
     original_filename: Mapped[str] = mapped_column(String(512))
     sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -99,6 +100,10 @@ class Track(Base):
     mime_type: Mapped[str | None] = mapped_column(String(255))
     audio_stream_index: Mapped[int] = mapped_column(Integer, default=0)
     duration_seconds: Mapped[float] = mapped_column(Float)
+    sample_rate: Mapped[int] = mapped_column(Integer, default=0)
+    channels: Mapped[int] = mapped_column(Integer, default=0)
+    bits_per_sample: Mapped[int] = mapped_column(Integer, default=0)
+    normalized: Mapped[bool] = mapped_column(Boolean, default=False)
     title: Mapped[str] = mapped_column(String(512))
     artist: Mapped[str] = mapped_column(String(512), default="未知艺人")
     album: Mapped[str] = mapped_column(String(512), default="")
@@ -111,6 +116,43 @@ class Track(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     playlist_items: Mapped[list[PlaylistItem]] = relationship(back_populates="track")
+
+
+class UploadJob(Base):
+    __tablename__ = "upload_jobs"
+    __table_args__ = (Index("ix_upload_jobs_status_created", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    client_id: Mapped[str] = mapped_column(String(64), index=True)
+    original_filename: Mapped[str] = mapped_column(String(512))
+    declared_size_bytes: Mapped[int] = mapped_column(Integer)
+    bytes_received: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    temp_name: Mapped[str | None] = mapped_column(String(255))
+    storage_id: Mapped[str | None] = mapped_column(String(80))
+    storage_name: Mapped[str | None] = mapped_column(String(255))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    track_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tracks.id", ondelete="SET NULL"), index=True
+    )
+    duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    client_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    owner: Mapped[User] = relationship()
+    track: Mapped[Track | None] = relationship()
 
 
 class PlaylistItem(Base):

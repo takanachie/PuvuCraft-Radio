@@ -36,13 +36,28 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="!online" class="network-banner" role="status">
-    <span class="status-lamp status-lamp--danger" aria-hidden="true"></span>
-    网络已断开，恢复连接后直播将自动回到实时位置
+  <div class="app-shell">
+    <div v-if="!online" class="network-banner" role="status">
+      <span class="status-lamp status-lamp--danger" aria-hidden="true"></span>
+      网络已断开，恢复连接后直播将自动回到实时位置
+    </div>
+    <div class="app-shell__route">
+      <RouterView v-slot="{ Component }">
+        <Transition name="route-fade" mode="out-in">
+          <component :is="Component" />
+        </Transition>
+      </RouterView>
+    </div>
+    <footer class="site-footer" aria-label="网站备案信息">
+      <a
+        href="https://beian.miit.gov.cn/"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        粤ICP备20002308号
+      </a>
+      <span class="site-footer__separator" aria-hidden="true">/</span>
+      <span>本网站仅供个人使用，不对外提供真实服务。</span>
+    </footer>
   </div>
-  <RouterView v-slot="{ Component }">
-    <Transition name="route-fade" mode="out-in">
-      <component :is="Component" />
-    </Transition>
-  </RouterView>
 </template>

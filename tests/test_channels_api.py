@@ -8,11 +8,13 @@ from .conftest import csrf_headers
 
 
 def _insert_track(client: TestClient, filename: str, digest: str) -> int:
-    media_path = client.app.state.settings.paths.media_dir / filename
+    storage = client.app.state.settings.storage.locations[0]
+    media_path = storage.root / filename
     media_path.parent.mkdir(parents=True, exist_ok=True)
     media_path.write_bytes(b"test-media")
     with client.app.state.database.session_factory.begin() as db:
         track = Track(
+            storage_id=storage.id,
             storage_name=filename,
             original_filename=filename,
             sha256=digest,
@@ -125,8 +127,12 @@ def test_hls_is_protected_and_authorized_by_channel(initialized_admin: TestClien
 def test_upload_rejects_unsupported_extension(initialized_admin: TestClient) -> None:
     client = initialized_admin
     response = client.post(
-        "/api/admin/tracks/upload",
+        "/api/admin/uploads",
         headers=csrf_headers(client),
-        files={"file": ("notes.txt", b"not audio", "text/plain")},
+        json={
+            "client_id": "a" * 32,
+            "filename": "notes.txt",
+            "size_bytes": 9,
+        },
     )
     assert response.status_code == 415

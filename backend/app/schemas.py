@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-.]{3,32}$")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+UPLOAD_CLIENT_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
 class ApiModel(BaseModel):
@@ -94,6 +95,30 @@ class TrackUpdate(ApiModel):
             return None
         if not (value.startswith("https://") or value.startswith("/api/covers/")):
             raise ValueError("封面 URL 必须使用 HTTPS 或本站封面路径")
+        return value
+
+
+class UploadReservationInput(ApiModel):
+    client_id: str
+    filename: str = Field(min_length=1, max_length=512)
+    size_bytes: int = Field(gt=0)
+
+    @field_validator("client_id")
+    @classmethod
+    def client_id_format(cls, value: str) -> str:
+        if not UPLOAD_CLIENT_RE.fullmatch(value):
+            raise ValueError("上传客户端标识无效")
+        return value
+
+
+class UploadHeartbeatInput(ApiModel):
+    client_id: str
+
+    @field_validator("client_id")
+    @classmethod
+    def client_id_format(cls, value: str) -> str:
+        if not UPLOAD_CLIENT_RE.fullmatch(value):
+            raise ValueError("上传客户端标识无效")
         return value
 
 

@@ -44,8 +44,6 @@ class ServerConfig(StrictModel):
 
 class PathsConfig(StrictModel):
     data_dir: Path
-    media_dir: Path
-    upload_temp_dir: Path
     cover_dir: Path
     hls_dir: Path
     log_dir: Path
@@ -132,6 +130,56 @@ class MediaConfig(StrictModel):
         return [value.lower() if value.startswith(".") else f".{value.lower()}" for value in values]
 
 
+class UploadsConfig(StrictModel):
+    temp_dir: Path
+    queue_limit: Literal[10] = 10
+    max_concurrent: int = Field(default=3, ge=2, le=32)
+    ready_lease_seconds: int = Field(default=120, ge=15, le=3600)
+    heartbeat_interval_seconds: int = Field(default=5, ge=1, le=60)
+    heartbeat_timeout_seconds: int = Field(default=15, ge=3, le=300)
+    progress_checkpoint_bytes: int = Field(default=4 * 1024 * 1024, ge=64 * 1024)
+    history_limit: int = Field(default=100, ge=10, le=1000)
+
+    @model_validator(mode="after")
+    def valid_queue(self) -> UploadsConfig:
+        if self.max_concurrent > self.queue_limit:
+            raise ValueError("uploads.max_concurrent cannot exceed uploads.queue_limit")
+        if self.heartbeat_timeout_seconds <= self.heartbeat_interval_seconds:
+            raise ValueError(
+                "uploads.heartbeat_timeout_seconds must exceed heartbeat_interval_seconds"
+            )
+        return self
+
+
+class StorageLocationConfig(StrictModel):
+    id: str
+    root: Path
+    priority: int = 0
+    max_usage_percent: float = Field(gt=0, le=100)
+    enabled: bool = True
+    create_if_missing: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str) -> str:
+        if not _SLUG_PATTERN.fullmatch(value):
+            raise ValueError("storage location id contains unsupported characters")
+        return value
+
+
+class StorageConfig(StrictModel):
+    locations: list[StorageLocationConfig]
+
+    @model_validator(mode="after")
+    def valid_locations(self) -> StorageConfig:
+        ids = [location.id for location in self.locations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("storage location ids must be unique")
+        if not any(location.enabled for location in self.locations):
+            raise ValueError("at least one storage location must be enabled")
+        return self
+
+
 class RestartConfig(StrictModel):
     initial_delay_seconds: float = Field(default=1, ge=0)
     max_delay_seconds: float = Field(default=30, gt=0)
@@ -151,6 +199,7 @@ class StreamOutputConfig(StrictModel):
     bitrate: str = "192k"
     sample_rate: int = Field(default=48000, ge=8000)
     channels: int = Field(default=2, ge=1, le=8)
+    sample_bits: Literal[32] = 32
 
 
 class HlsConfig(StrictModel):
@@ -241,6 +290,8 @@ class Settings(StrictModel):
     auth: AuthConfig
     bootstrap: BootstrapConfig
     media: MediaConfig
+    uploads: UploadsConfig
+    storage: StorageConfig
     ffmpeg: FfmpegConfig
     streaming: StreamingConfig
     stream_access: StreamAccessConfig
@@ -313,6 +364,16 @@ def _resolve_paths(data: dict[str, object], base: Path) -> None:
         media["import_directories"] = [
             _absolute_path(base, value) for value in media["import_directories"]
         ]
+
+    uploads = data.get("uploads")
+    if isinstance(uploads, dict) and isinstance(uploads.get("temp_dir"), (str, Path)):
+        uploads["temp_dir"] = _absolute_path(base, uploads["temp_dir"])
+
+    storage = data.get("storage")
+    if isinstance(storage, dict) and isinstance(storage.get("locations"), list):
+        for location in storage["locations"]:
+            if isinstance(location, dict) and isinstance(location.get("root"), (str, Path)):
+                location["root"] = _absolute_path(base, location["root"])
 
     logging = data.get("logging")
     if isinstance(logging, dict) and isinstance(logging.get("file"), (str, Path)):

@@ -28,6 +28,7 @@ from ..models import (
 from ..security import aware_utc
 from ..serializers import iso, track_dict
 from .events import EventBroker
+from .storage import StorageManager, StorageUnavailable
 from .timeline import (
     TimelineSelection,
     force_timeline_item,
@@ -46,9 +47,15 @@ class ChannelCommand:
 
 
 class PlaybackManager:
-    def __init__(self, settings: Settings, database: Database) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        storage: StorageManager,
+    ) -> None:
         self.settings = settings
         self.database = database
+        self.storage = storage
         self.events = EventBroker()
         self._supervisors: dict[int, ChannelSupervisor] = {}
         self._snapshots: dict[int, dict[str, object]] = {}
@@ -247,6 +254,7 @@ class ChannelSupervisor:
         self.manager = manager
         self.settings = manager.settings
         self.database = manager.database
+        self.storage = manager.storage
         self.channel_id = channel_id
         self.slug = slug
         self.commands: asyncio.Queue[ChannelCommand] = asyncio.Queue()
@@ -495,11 +503,19 @@ class ChannelSupervisor:
             track = item.track
             track_data = {
                 "id": track.id,
+                "storage_id": track.storage_id,
                 "storage_name": track.storage_name,
                 "stream_index": track.audio_stream_index,
                 "duration": track.duration_seconds,
             }
-        media_path = self.settings.paths.media_dir / str(track_data["storage_name"])
+        try:
+            media_path = self.storage.resolve(
+                str(track_data["storage_id"]),
+                str(track_data["storage_name"]),
+            )
+        except StorageUnavailable:
+            self._mark_track_missing(int(track_data["id"]))
+            return ChannelCommand("skip")
         if not media_path.is_file():
             self._mark_track_missing(int(track_data["id"]))
             return ChannelCommand("skip")

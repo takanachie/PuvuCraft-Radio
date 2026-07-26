@@ -10,7 +10,9 @@ PuvuCraft Radio 是基于 FastAPI、Vue 3、FFmpeg 和 HLS 的多频道同步在
 - 用户注册、管理员审批、Argon2id 密码和可撤销 Cookie 会话
 - 一次性令牌保护的首次管理员网页向导
 - 频道、音乐库、歌单和播放控制后台
-- 上传及服务器目录扫描、ffprobe 验证、标签和内嵌封面提取
+- 所有管理员可见的 10 位持久化上传队列、并行传输和断页清理
+- ffprobe 验证、标签与封面提取，以及超规格音频的 FLAC 规范化
+- 基于优先级和磁盘使用率上限的多挂载媒体存储
 - 每频道持续 HLS 编码器、同步播放时间线、切歌和重启恢复
 - Vue 3 深色电台控制台、hls.js 播放器和 SSE 状态更新
 - Nginx `auth_request`、HTTPS 和 systemd 部署模板

@@ -21,12 +21,14 @@ def settings(tmp_path: Path) -> Settings:
     value.app.environment = "test"
     value.app.public_base_url = "http://testserver"
     value.paths.data_dir = tmp_path
-    value.paths.media_dir = tmp_path / "media"
-    value.paths.upload_temp_dir = tmp_path / "tmp" / "uploads"
     value.paths.cover_dir = tmp_path / "covers"
     value.paths.hls_dir = tmp_path / "runtime" / "hls"
     value.paths.log_dir = tmp_path / "logs"
     value.paths.bootstrap_token_file = tmp_path / "bootstrap.token"
+    value.uploads.temp_dir = tmp_path / "tmp"
+    value.storage.locations[0].root = tmp_path / "media"
+    value.storage.locations[0].enabled = True
+    value.storage.locations[0].create_if_missing = True
     value.database.url = f"sqlite:///{tmp_path / 'radio.db'}"
     value.media.import_directories = [tmp_path / "import"]
     value.ffmpeg.binary = tmp_path / "missing-ffmpeg"

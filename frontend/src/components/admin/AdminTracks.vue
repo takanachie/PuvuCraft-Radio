@@ -1,29 +1,74 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from '../../api'
-import { userFacingError } from '../../api/client'
-import type { EntityId, Track, TrackInput } from '../../api/types'
+import { getCookie, userFacingError } from '../../api/client'
+import type {
+  EntityId,
+  Track,
+  TrackInput,
+  UploadJob,
+  UploadJobStatus,
+  UploadQueueSnapshot,
+} from '../../api/types'
 import { formatDuration, formatFileSize } from '../../utils/format'
 import InlineNotice from '../InlineNotice.vue'
 import StatusBadge from '../StatusBadge.vue'
 
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+const CLIENT_BOUND_UPLOADS = new Set<UploadJobStatus>(['queued', 'ready', 'uploading'])
+const TERMINAL_UPLOADS = new Set<UploadJobStatus>(['completed', 'failed', 'cancelled', 'expired'])
+const UPLOAD_LABELS: Record<UploadJobStatus, string> = {
+  queued: '排队中',
+  ready: '等待传输',
+  uploading: '上传中',
+  verifying: '校验中',
+  normalizing: '规范化',
+  placing: '迁移中',
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+  expired: '已过期',
+}
+
+function createUploadClientId(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+const uploadClientId = createUploadClientId()
 const tracks = ref<Track[]>([])
 const loading = ref(true)
 const scanning = ref(false)
-const uploading = ref(false)
+const reserving = ref(false)
 const saving = ref(false)
 const error = ref('')
 const notice = ref('')
 const search = ref('')
 const selectedFiles = ref<File[]>([])
-const uploadProgress = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
 const editingId = ref<EntityId | null>(null)
 const coverFile = ref<File | null>(null)
 const editForm = reactive<TrackInput>({ title: '', artist: '', album: '', cover_url: '' })
+const uploadQueue = ref<UploadQueueSnapshot>({
+  jobs: [],
+  queue_limit: 10,
+  max_concurrent: 3,
+  active_count: 0,
+  available_slots: 0,
+  heartbeat_interval_seconds: 5,
+})
+const queueLoading = ref(true)
+const localUploadBytes = reactive<Record<string, number>>({})
+const filesByJob = new Map<string, File>()
+const requestsByJob = new Map<string, XMLHttpRequest>()
+const handledTerminalJobs = new Set<string>()
+let eventSource: EventSource | null = null
+let heartbeatTimer: number | undefined
+let heartbeatSeconds = 0
+let leaving = false
 
 const editingTrack = computed(() => tracks.value.find((track) => String(track.id) === String(editingId.value)) || null)
-const hasOversizedFile = computed(() => selectedFiles.value.some((file) => file.size > 500 * 1024 * 1024))
+const hasOversizedFile = computed(() => selectedFiles.value.some((file) => file.size > MAX_UPLOAD_BYTES))
 const filteredTracks = computed(() => {
   const needle = search.value.trim().toLocaleLowerCase()
   if (!needle) return tracks.value
@@ -60,32 +105,211 @@ function chooseFiles(event: Event) {
   const input = event.target as HTMLInputElement
   selectedFiles.value = Array.from(input.files || [])
   error.value = ''
-  const oversized = selectedFiles.value.find((file) => file.size > 500 * 1024 * 1024)
+  const oversized = selectedFiles.value.find((file) => file.size > MAX_UPLOAD_BYTES)
   if (oversized) error.value = `${oversized.name} 超过 500 MiB 上传上限。`
 }
 
-async function upload() {
-  if (!selectedFiles.value.length || uploading.value) return
-  if (selectedFiles.value.some((file) => file.size > 500 * 1024 * 1024)) return
-  clearMessages()
-  uploading.value = true
-  let completed = 0
-  try {
-    for (const [index, file] of selectedFiles.value.entries()) {
-      uploadProgress.value = `${index + 1} / ${selectedFiles.value.length} · ${file.name}`
-      await api.admin.uploadTrack(file)
-      completed += 1
-    }
-    selectedFiles.value = []
-    if (fileInput.value) fileInput.value.value = ''
-    await load()
-    notice.value = `已处理 ${completed} 个上传文件；重复内容由服务器按哈希策略处理。`
-  } catch (cause) {
-    error.value = `${completed ? `已完成 ${completed} 个文件。` : ''}${userFacingError(cause, '音频上传失败')}`
-  } finally {
-    uploading.value = false
-    uploadProgress.value = ''
+function isOwnedJob(job: UploadJob): boolean {
+  return job.client_id === uploadClientId
+}
+
+function uploadStatus(job: UploadJob): string {
+  if (job.status === 'queued' && job.queue_position) {
+    return `${UPLOAD_LABELS[job.status]} · 第 ${job.queue_position} 位`
   }
+  return UPLOAD_LABELS[job.status]
+}
+
+function uploadBytes(job: UploadJob): number {
+  return localUploadBytes[job.id] ?? job.bytes_received
+}
+
+function uploadPercent(job: UploadJob): number {
+  if (job.status === 'completed' || ['verifying', 'normalizing', 'placing'].includes(job.status)) {
+    return 100
+  }
+  if (!job.declared_size_bytes) return 0
+  return Math.min(100, Math.round(uploadBytes(job) / job.declared_size_bytes * 100))
+}
+
+function trackAudioDetail(track: Track): string {
+  const parts: string[] = []
+  if (track.sample_rate) parts.push(`${(track.sample_rate / 1000).toFixed(track.sample_rate % 1000 ? 1 : 0)} kHz`)
+  if (track.channels) parts.push(`${track.channels} ch`)
+  if (track.bits_per_sample) parts.push(`${track.bits_per_sample} bit`)
+  if (track.normalized) parts.push('FLAC 规范化')
+  return parts.join(' · ')
+}
+
+function xhrError(xhr: XMLHttpRequest): string {
+  try {
+    const payload = JSON.parse(xhr.responseText) as { message?: string; detail?: string | { message?: string } }
+    if (payload.message) return payload.message
+    if (typeof payload.detail === 'string') return payload.detail
+    if (payload.detail?.message) return payload.detail.message
+  } catch {
+    // A proxy or network failure may return a non-JSON response.
+  }
+  return xhr.status ? `上传请求失败 (${xhr.status})` : '上传连接已中断'
+}
+
+function startTransfer(job: UploadJob) {
+  const file = filesByJob.get(job.id)
+  if (!file || requestsByJob.has(job.id) || job.status !== 'ready' || !isOwnedJob(job)) return
+  if (file.name !== job.original_filename || file.size !== job.declared_size_bytes) {
+    error.value = `${job.original_filename} 与预约文件不一致，任务将被取消。`
+    void cancelUpload(job)
+    return
+  }
+
+  const xhr = new XMLHttpRequest()
+  requestsByJob.set(job.id, xhr)
+  xhr.open('PUT', `/api/admin/uploads/${encodeURIComponent(job.id)}/content`)
+  xhr.withCredentials = true
+  xhr.setRequestHeader('Accept', 'application/json')
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+  xhr.setRequestHeader('X-Upload-Client-ID', uploadClientId)
+  const csrfToken = getCookie('radio_csrf')
+  if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken)
+  xhr.upload.onprogress = (event) => {
+    localUploadBytes[job.id] = event.loaded
+  }
+  xhr.onload = () => {
+    requestsByJob.delete(job.id)
+    if (xhr.status >= 200 && xhr.status < 300) {
+      localUploadBytes[job.id] = file.size
+      notice.value = `${file.name} 已传输完成，服务器正在校验并按需规范化。`
+    } else if (!leaving) {
+      error.value = `${file.name}：${xhrError(xhr)}`
+    }
+    void refreshUploadQueue()
+  }
+  xhr.onerror = () => {
+    requestsByJob.delete(job.id)
+    if (!leaving) error.value = `${file.name}：上传连接已中断。`
+    void refreshUploadQueue()
+  }
+  xhr.onabort = () => {
+    requestsByJob.delete(job.id)
+    delete localUploadBytes[job.id]
+  }
+  xhr.send(file)
+}
+
+function applyUploadSnapshot(snapshot: UploadQueueSnapshot) {
+  uploadQueue.value = snapshot
+  queueLoading.value = false
+  startHeartbeat(snapshot.heartbeat_interval_seconds)
+  let refreshLibrary = false
+  for (const job of snapshot.jobs) {
+    if (job.status === 'ready') startTransfer(job)
+    if (TERMINAL_UPLOADS.has(job.status) && !handledTerminalJobs.has(job.id)) {
+      handledTerminalJobs.add(job.id)
+      if (job.status === 'completed') refreshLibrary = true
+      if (isOwnedJob(job)) {
+        if (job.status === 'completed') {
+          notice.value = job.duplicate
+            ? `${job.original_filename} 已完成；内容重复，沿用现有曲目。`
+            : `${job.original_filename} 已完成并写入 ${job.storage_id || '可用存储'}。`
+        } else if (job.status === 'failed') {
+          error.value = `${job.original_filename}：${job.error_message || '服务器处理失败'}`
+        }
+      }
+      filesByJob.delete(job.id)
+      delete localUploadBytes[job.id]
+    }
+  }
+  if (refreshLibrary) void load(false)
+}
+
+async function refreshUploadQueue() {
+  try {
+    applyUploadSnapshot(await api.admin.uploadQueue())
+  } catch (cause) {
+    if (!leaving) error.value = userFacingError(cause, '无法读取公共上传队列')
+  } finally {
+    queueLoading.value = false
+  }
+}
+
+function parseQueueEvent(event: Event) {
+  try {
+    applyUploadSnapshot(JSON.parse((event as MessageEvent<string>).data) as UploadQueueSnapshot)
+  } catch {
+    if (!leaving) error.value = '公共上传队列返回了无效状态。'
+  }
+}
+
+function connectUploadEvents() {
+  eventSource = new EventSource('/api/admin/uploads/events', { withCredentials: true })
+  eventSource.addEventListener('upload_queue', parseQueueEvent)
+  eventSource.onerror = () => {
+    if (!leaving) void refreshUploadQueue()
+  }
+}
+
+function startHeartbeat(seconds: number) {
+  const nextSeconds = Math.max(1, seconds)
+  if (heartbeatTimer !== undefined && heartbeatSeconds === nextSeconds) return
+  if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
+  heartbeatSeconds = nextSeconds
+  heartbeatTimer = window.setInterval(() => {
+    void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
+  }, nextSeconds * 1000)
+}
+
+async function reserveSelectedFiles() {
+  if (!selectedFiles.value.length || reserving.value || hasOversizedFile.value) return
+  clearMessages()
+  reserving.value = true
+  const accepted = new Set<File>()
+  try {
+    for (const file of selectedFiles.value) {
+      const job = await api.admin.reserveUpload(uploadClientId, file)
+      filesByJob.set(job.id, file)
+      accepted.add(file)
+    }
+    notice.value = `已申请 ${accepted.size} 个上传任务；服务器将在并行位置空闲时自动开始传输。`
+  } catch (cause) {
+    const prefix = accepted.size ? `已成功申请 ${accepted.size} 个任务；` : ''
+    error.value = `${prefix}${userFacingError(cause, '无法申请上传队列位置')}`
+  } finally {
+    selectedFiles.value = selectedFiles.value.filter((file) => !accepted.has(file))
+    if (!selectedFiles.value.length && fileInput.value) fileInput.value.value = ''
+    reserving.value = false
+    void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
+    await refreshUploadQueue()
+  }
+}
+
+async function cancelUpload(job: UploadJob) {
+  if (!isOwnedJob(job) || !CLIENT_BOUND_UPLOADS.has(job.status)) return
+  requestsByJob.get(job.id)?.abort()
+  try {
+    await api.admin.cancelUpload(job.id)
+  } catch (cause) {
+    error.value = userFacingError(cause, '无法取消上传任务')
+  } finally {
+    await refreshUploadQueue()
+  }
+}
+
+function expireOwnedUploads() {
+  leaving = true
+  for (const xhr of [...requestsByJob.values()]) xhr.abort()
+  const csrfToken = getCookie('radio_csrf')
+  const headers = new Headers({
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  })
+  if (csrfToken) headers.set('X-CSRF-Token', csrfToken)
+  void fetch('/api/admin/uploads/expire', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ client_id: uploadClientId }),
+    credentials: 'include',
+    keepalive: true,
+  }).catch(() => undefined)
 }
 
 async function scan() {
@@ -187,7 +411,20 @@ async function remove(track: Track) {
   }
 }
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  void refreshUploadQueue()
+  connectUploadEvents()
+  startHeartbeat(5)
+  window.addEventListener('beforeunload', expireOwnedUploads)
+})
+
+onBeforeUnmount(() => {
+  expireOwnedUploads()
+  window.removeEventListener('beforeunload', expireOwnedUploads)
+  eventSource?.close()
+  if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
+})
 </script>
 
 <template>
@@ -219,15 +456,81 @@ onMounted(() => void load())
         <div v-if="selectedFiles.length" class="file-queue">
           <span v-for="file in selectedFiles" :key="`${file.name}-${file.lastModified}`">{{ file.name }} <small>{{ formatFileSize(file.size) }}</small></span>
         </div>
-        <button class="button button--primary" type="button" :disabled="uploading || !selectedFiles.length || hasOversizedFile" @click="upload">
-          {{ uploading ? `正在上传 ${uploadProgress}` : '上传并导入' }}
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="reserving || !selectedFiles.length || hasOversizedFile || (!queueLoading && uploadQueue.available_slots === 0)"
+          @click="reserveSelectedFiles"
+        >
+          {{ reserving ? '正在申请…' : `申请上传队列 · ${uploadQueue.available_slots}/${uploadQueue.queue_limit} 空位` }}
         </button>
+        <small class="ingest-note">页面保持开启时服务器才会安排传输；关闭页面会取消排队及上传中的任务并清理临时文件。</small>
       </div>
       <div class="ingest-rack__scan">
         <span class="eyebrow">Server import</span>
         <strong>扫描受信任目录</strong>
-        <p>服务器会验证音频流、提取标签与封面、检测 SHA-256 重复，并标记消失的文件。</p>
+        <p>服务器会验证音频流、提取标签与封面、检测 SHA-256 重复；超出推流限制的文件将先规范化为 FLAC。</p>
         <button class="button button--quiet" type="button" :disabled="scanning" @click="scan">{{ scanning ? '扫描进行中…' : '开始目录扫描' }}</button>
+      </div>
+    </section>
+
+    <section class="upload-queue-panel" aria-labelledby="upload-queue-title">
+      <header class="upload-queue-panel__header">
+        <div>
+          <span class="eyebrow">Shared upload queue</span>
+          <h3 id="upload-queue-title">公共上传队列</h3>
+          <p>所有管理员共享 {{ uploadQueue.queue_limit }} 个任务位置；服务器最多并行处理 {{ uploadQueue.max_concurrent }} 个任务。</p>
+        </div>
+        <div class="queue-metrics">
+          <span><strong>{{ uploadQueue.active_count }}</strong>处理中</span>
+          <span><strong>{{ uploadQueue.available_slots }}</strong>空位</span>
+        </div>
+      </header>
+      <div class="data-frame">
+        <table class="console-table upload-queue-table">
+          <thead><tr><th>文件</th><th>申请人</th><th>进度</th><th>阶段</th><th>存储</th><th class="align-right">操作</th></tr></thead>
+          <tbody>
+            <tr v-if="queueLoading"><td colspan="6" class="table-message">正在连接公共上传队列…</td></tr>
+            <tr v-else-if="!uploadQueue.jobs.length"><td colspan="6" class="table-message">上传队列为空。</td></tr>
+            <template v-else>
+              <tr v-for="job in uploadQueue.jobs" :key="job.id">
+                <td data-label="文件">
+                  <strong>{{ job.original_filename }}</strong>
+                  <small>{{ formatFileSize(job.declared_size_bytes) }} · {{ job.id.slice(0, 8) }}</small>
+                </td>
+                <td data-label="申请人">
+                  <strong>{{ job.owner.username }}</strong>
+                  <small>{{ isOwnedJob(job) ? '本页面任务' : '其他管理员' }}</small>
+                </td>
+                <td data-label="进度">
+                  <div class="upload-progress">
+                    <span><i :style="{ width: `${uploadPercent(job)}%` }"></i></span>
+                    <small>{{ uploadPercent(job) }}% · {{ formatFileSize(uploadBytes(job)) }}</small>
+                  </div>
+                </td>
+                <td data-label="阶段">
+                  <StatusBadge :status="job.status" :label="uploadStatus(job)" />
+                  <small v-if="job.error_message" class="queue-error">{{ job.error_message }}</small>
+                </td>
+                <td data-label="存储">
+                  <strong>{{ job.storage_id || '—' }}</strong>
+                  <small>{{ job.duplicate ? '重复内容复用' : job.status === 'completed' ? '已落盘' : '自动选择' }}</small>
+                </td>
+                <td data-label="操作" class="table-actions">
+                  <button
+                    v-if="isOwnedJob(job) && CLIENT_BOUND_UPLOADS.has(job.status)"
+                    class="button button--danger button--small"
+                    type="button"
+                    @click="cancelUpload(job)"
+                  >
+                    取消
+                  </button>
+                  <span v-else class="queue-action-placeholder">—</span>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -253,7 +556,12 @@ onMounted(() => void load())
               </td>
               <td data-label="专辑">{{ track.album || '—' }}</td>
               <td data-label="时长" class="mono-label">{{ formatDuration(track.duration_seconds) }}</td>
-              <td data-label="文件"><span class="file-detail">{{ track.original_filename || '服务器媒体' }}<small>{{ formatFileSize(track.file_size_bytes) }}</small></span></td>
+              <td data-label="文件">
+                <span class="file-detail">
+                  {{ track.original_filename || '服务器媒体' }}
+                  <small>{{ formatFileSize(track.file_size_bytes) }}<template v-if="trackAudioDetail(track)"> · {{ trackAudioDetail(track) }}</template></small>
+                </span>
+              </td>
               <td data-label="状态"><StatusBadge :status="track.available === false ? 'unavailable' : 'available'" /></td>
               <td data-label="操作" class="table-actions">
                 <button class="button button--quiet button--small" type="button" @click="beginEdit(track)">编辑</button>

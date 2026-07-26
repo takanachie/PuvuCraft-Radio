@@ -11,10 +11,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from .config import Settings, load_settings
 from .database import Database
 from .errors import install_error_handlers
-from .routers import admin, auth, channels
+from .routers import admin, auth, channels, uploads
 from .security import AuthService, BootstrapManager, RateLimiter
 from .services.media import MediaService
 from .services.playback import PlaybackManager
+from .services.storage import StorageManager
+from .services.uploads import UploadManager
 
 
 def configure_logging(settings: Settings) -> None:
@@ -51,15 +53,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(settings)
     auth_service = AuthService(settings)
     bootstrap = BootstrapManager(settings)
-    media = MediaService(settings)
-    playback = PlaybackManager(settings, database)
+    storage = StorageManager(settings)
+    media = MediaService(settings, storage)
+    playback = PlaybackManager(settings, database, storage)
+    upload_manager = UploadManager(database, media, storage)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         for path in (
             settings.paths.data_dir,
-            settings.paths.media_dir,
-            settings.paths.upload_temp_dir,
             settings.paths.cover_dir,
             settings.paths.hls_dir,
             settings.paths.log_dir,
@@ -70,11 +72,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with database.session_factory.begin() as db:
             auth_service.cleanup_sessions(db)
         bootstrap.synchronize(database.has_admin())
+        await upload_manager.start()
         await playback.start()
         try:
             yield
         finally:
             await playback.stop()
+            await upload_manager.stop()
             database.close()
 
     app = FastAPI(
@@ -90,13 +94,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.auth = auth_service
     app.state.bootstrap = bootstrap
     app.state.rate_limiter = RateLimiter()
+    app.state.storage = storage
     app.state.media = media
     app.state.playback = playback
+    app.state.uploads = upload_manager
 
     install_error_handlers(app)
     app.include_router(auth.router)
     app.include_router(channels.router)
     app.include_router(admin.router)
+    app.include_router(uploads.router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import base64
-import hashlib
+import contextlib
 import json
 import mimetypes
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 from mutagen import File as MutagenFile
 from mutagen.flac import Picture
@@ -22,6 +23,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings
 from ..errors import ApiError
 from ..models import Track, utcnow
+from .storage import StorageManager, StorageUnavailable
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,9 @@ class ProbeResult:
     duration_seconds: float
     audio_stream_index: int
     mime_type: str | None
+    sample_rate: int
+    channels: int
+    bits_per_sample: int
 
 
 @dataclass(frozen=True)
@@ -40,42 +45,39 @@ class ExtractedMetadata:
     cover_extension: str | None
 
 
-class MediaService:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
+StatusCallback = Callable[[str], None]
 
-    def _validate_extension(self, filename: str) -> str:
+
+class MediaService:
+    def __init__(self, settings: Settings, storage: StorageManager) -> None:
+        self.settings = settings
+        self.storage = storage
+        self._digest_locks = tuple(threading.Lock() for _ in range(64))
+
+    def validate_filename(self, filename: str) -> str:
         extension = Path(filename).suffix.lower()
         if extension not in self.settings.media.allowed_extensions:
             raise ApiError(415, "unsupported_media", "不支持该音频文件格式")
         return extension
 
-    def stage_upload(self, source: BinaryIO, filename: str) -> Path:
-        extension = self._validate_extension(filename)
-        target_dir = self.settings.paths.upload_temp_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        fd, raw_path = tempfile.mkstemp(prefix="upload-", suffix=extension, dir=target_dir)
-        size = 0
-        try:
-            with os.fdopen(fd, "wb") as destination:
-                while chunk := source.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > self.settings.media.max_upload_bytes:
-                        raise ApiError(413, "file_too_large", "音频文件超过 500 MiB 上限")
-                    destination.write(chunk)
-            if size == 0:
-                raise ApiError(422, "empty_file", "上传文件为空")
-            return Path(raw_path)
-        except Exception:
-            Path(raw_path).unlink(missing_ok=True)
-            raise
-
-    def _sha256(self, path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
+    @staticmethod
+    def _sample_bits(audio: dict[str, object]) -> int:
+        for key in ("bits_per_raw_sample", "bits_per_sample"):
+            try:
+                value = int(str(audio.get(key) or "0"))
+            except ValueError:
+                value = 0
+            if value > 0:
+                return value
+        sample_format = str(audio.get("sample_fmt") or "").removesuffix("p")
+        return {
+            "u8": 8,
+            "s16": 16,
+            "s32": 32,
+            "s64": 64,
+            "flt": 32,
+            "dbl": 64,
+        }.get(sample_format, 32)
 
     def _probe(self, path: Path) -> ProbeResult:
         binary = self.settings.ffmpeg.ffprobe_binary
@@ -113,17 +115,28 @@ class MediaService:
         if format_names.isdisjoint(allowed_formats):
             raise ApiError(415, "unsupported_container", "音频容器格式不受支持")
         audio = next((item for item in streams if item.get("codec_type") == "audio"), None)
-        if audio is None:
+        if not isinstance(audio, dict):
             raise ApiError(422, "no_audio_stream", "文件中没有可播放的音频流")
         raw_duration = audio.get("duration") or (payload.get("format") or {}).get("duration")
         try:
             duration = float(raw_duration)
+            sample_rate = int(audio.get("sample_rate") or 0)
+            channels = int(audio.get("channels") or 0)
         except (TypeError, ValueError) as exc:
-            raise ApiError(422, "missing_duration", "无法确定音频时长") from exc
+            raise ApiError(422, "invalid_audio_parameters", "无法确定音频采样参数") from exc
         if not 0 < duration <= 24 * 60 * 60:
             raise ApiError(422, "invalid_duration", "音频时长无效或超过 24 小时")
+        if sample_rate <= 0 or channels <= 0:
+            raise ApiError(422, "invalid_audio_parameters", "音频采样率或声道数无效")
         mime_type, _ = mimetypes.guess_type(path.name)
-        return ProbeResult(duration, int(audio.get("index", 0)), mime_type)
+        return ProbeResult(
+            duration_seconds=duration,
+            audio_stream_index=int(audio.get("index", 0)),
+            mime_type=mime_type,
+            sample_rate=sample_rate,
+            channels=channels,
+            bits_per_sample=self._sample_bits(audio),
+        )
 
     @staticmethod
     def _first_tag(tags: object, names: tuple[str, ...]) -> str:
@@ -198,51 +211,193 @@ class MediaService:
             cover_extension = None
         return ExtractedMetadata(title, artist, album, cover, cover_extension)
 
+    def _requires_normalization(self, probe: ProbeResult) -> bool:
+        output = self.settings.streaming.output
+        return (
+            probe.sample_rate > output.sample_rate
+            or probe.channels > output.channels
+            or probe.bits_per_sample > output.sample_bits
+        )
+
+    def _normalize(self, source: Path, probe: ProbeResult) -> tuple[Path, ProbeResult]:
+        binary = self.settings.ffmpeg.binary
+        if not binary.is_file():
+            raise ApiError(503, "ffmpeg_unavailable", f"找不到 FFmpeg：{binary}")
+        self.storage.normalized_dir.mkdir(parents=True, exist_ok=True)
+        fd, raw_path = tempfile.mkstemp(
+            prefix="normalized-", suffix=".flac", dir=self.storage.normalized_dir
+        )
+        os.close(fd)
+        target = Path(raw_path)
+        output = self.settings.streaming.output
+        target_rate = min(probe.sample_rate, output.sample_rate)
+        target_channels = min(probe.channels, output.channels)
+        target_sample_format = "s16" if probe.bits_per_sample <= 16 else "s32"
+        timeout = max(300, min(7200, int(probe.duration_seconds * 4)))
+        try:
+            subprocess.run(
+                [
+                    str(binary),
+                    "-hide_banner",
+                    "-loglevel",
+                    self.settings.ffmpeg.log_level,
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-map",
+                    f"0:{probe.audio_stream_index}",
+                    "-vn",
+                    "-sn",
+                    "-dn",
+                    "-map_metadata",
+                    "-1",
+                    "-c:a",
+                    "flac",
+                    "-compression_level",
+                    "8",
+                    "-ar",
+                    str(target_rate),
+                    "-ac",
+                    str(target_channels),
+                    "-sample_fmt",
+                    target_sample_format,
+                    str(target),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            normalized_probe = self._probe(target)
+        except subprocess.TimeoutExpired as exc:
+            raise ApiError(422, "normalization_timeout", "音频规范化处理超时") from exc
+        except subprocess.CalledProcessError as exc:
+            raise ApiError(422, "normalization_failed", "FFmpeg 无法规范化该音频") from exc
+        output = self.settings.streaming.output
+        if (
+            normalized_probe.sample_rate > output.sample_rate
+            or normalized_probe.channels > output.channels
+            or normalized_probe.bits_per_sample > output.sample_bits
+        ):
+            raise ApiError(422, "normalization_invalid", "规范化后的音频仍超过推流采样限制")
+        return target, normalized_probe
+
+    def _write_cover(self, metadata: ExtractedMetadata) -> str | None:
+        if not metadata.cover or not metadata.cover_extension:
+            return None
+        self.settings.paths.cover_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{uuid.uuid4().hex}{metadata.cover_extension}"
+        target = self.settings.paths.cover_dir / name
+        fd, temporary_name = tempfile.mkstemp(prefix="cover-", dir=self.settings.paths.cover_dir)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(metadata.cover)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, target)
+            return name
+        except Exception:
+            Path(temporary_name).unlink(missing_ok=True)
+            raise
+
     def import_staged(
         self,
         db: Session,
         staged_path: Path,
         original_filename: str,
+        *,
+        job_id: str | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> tuple[Track, bool]:
-        extension = self._validate_extension(original_filename)
+        original_extension = self.validate_filename(original_filename)
+        normalized_path: Path | None = None
+        placement_path: Path | None = None
+        cover_name: str | None = None
+        digest_lock = None
         try:
-            digest = self._sha256(staged_path)
-            existing = db.scalar(select(Track).where(Track.sha256 == digest))
-            if existing is not None:
-                existing_path = self.settings.paths.media_dir / existing.storage_name
-                if not existing_path.is_file() or not existing.available:
-                    self._probe(staged_path)
-                    self.settings.paths.media_dir.mkdir(parents=True, exist_ok=True)
-                    os.replace(staged_path, existing_path)
-                    existing.file_size_bytes = existing_path.stat().st_size
-                    existing.available = True
-                    existing.unavailable_reason = None
-                    existing.decode_failures = 0
-                    existing.updated_at = utcnow()
-                    db.commit()
-                else:
-                    staged_path.unlink(missing_ok=True)
-                return existing, True
             probe = self._probe(staged_path)
             metadata = self._extract_metadata(staged_path, original_filename)
-            storage_name = f"{uuid.uuid4().hex}{extension}"
-            media_path = self.settings.paths.media_dir / storage_name
-            self.settings.paths.media_dir.mkdir(parents=True, exist_ok=True)
-            os.replace(staged_path, media_path)
-            cover_name: str | None = None
-            if metadata.cover and metadata.cover_extension:
-                self.settings.paths.cover_dir.mkdir(parents=True, exist_ok=True)
-                cover_name = f"{uuid.uuid4().hex}{metadata.cover_extension}"
-                (self.settings.paths.cover_dir / cover_name).write_bytes(metadata.cover)
+            normalized = self._requires_normalization(probe)
+            retained_path = staged_path
+            final_extension = original_extension
+            if normalized:
+                if status_callback:
+                    status_callback("normalizing")
+                normalized_path, probe = self._normalize(staged_path, probe)
+                retained_path = normalized_path
+                final_extension = ".flac"
+            digest = self.storage.sha256(retained_path)
+            digest_lock = self._digest_locks[int(digest[:2], 16) % len(self._digest_locks)]
+            digest_lock.acquire()
+            existing = db.scalar(select(Track).where(Track.sha256 == digest))
+            if existing is not None:
+                try:
+                    existing_path = self.storage.track_path(existing)
+                except StorageUnavailable:
+                    existing_path = None
+                if existing_path is not None and existing_path.is_file() and existing.available:
+                    return existing, True
+                if status_callback:
+                    status_callback("placing")
+                try:
+                    placement = self.storage.place(
+                        retained_path,
+                        final_extension,
+                        digest,
+                        job_id or uuid.uuid4().hex,
+                    )
+                except StorageUnavailable as exc:
+                    raise ApiError(507, "storage_unavailable", str(exc)) from exc
+                placement_path = placement.path
+                old_location = (existing.storage_id, existing.storage_name)
+                existing.storage_id = placement.storage_id
+                existing.storage_name = placement.storage_name
+                existing.file_size_bytes = placement.size_bytes
+                existing.mime_type = probe.mime_type
+                existing.audio_stream_index = probe.audio_stream_index
+                existing.duration_seconds = probe.duration_seconds
+                existing.sample_rate = probe.sample_rate
+                existing.channels = probe.channels
+                existing.bits_per_sample = probe.bits_per_sample
+                existing.normalized = normalized
+                existing.available = True
+                existing.unavailable_reason = None
+                existing.decode_failures = 0
+                existing.updated_at = utcnow()
+                db.commit()
+                placement_path = None
+                if old_location != (existing.storage_id, existing.storage_name):
+                    with contextlib.suppress(OSError, StorageUnavailable):
+                        self.storage.delete(*old_location)
+                return existing, True
+
+            if status_callback:
+                status_callback("placing")
+            try:
+                placement = self.storage.place(
+                    retained_path,
+                    final_extension,
+                    digest,
+                    job_id or uuid.uuid4().hex,
+                )
+            except StorageUnavailable as exc:
+                raise ApiError(507, "storage_unavailable", str(exc)) from exc
+            placement_path = placement.path
+            cover_name = self._write_cover(metadata)
             now = utcnow()
             track = Track(
-                storage_name=storage_name,
+                storage_id=placement.storage_id,
+                storage_name=placement.storage_name,
                 original_filename=Path(original_filename).name,
                 sha256=digest,
-                file_size_bytes=media_path.stat().st_size,
+                file_size_bytes=placement.size_bytes,
                 mime_type=probe.mime_type,
                 audio_stream_index=probe.audio_stream_index,
                 duration_seconds=probe.duration_seconds,
+                sample_rate=probe.sample_rate,
+                channels=probe.channels,
+                bits_per_sample=probe.bits_per_sample,
+                normalized=normalized,
                 title=metadata.title,
                 artist=metadata.artist,
                 album=metadata.album,
@@ -256,33 +411,42 @@ class MediaService:
                 db.commit()
             except IntegrityError:
                 db.rollback()
-                media_path.unlink(missing_ok=True)
+                placement_path.unlink(missing_ok=True)
+                placement_path = None
                 if cover_name:
                     (self.settings.paths.cover_dir / cover_name).unlink(missing_ok=True)
+                    cover_name = None
                 winner = db.scalar(select(Track).where(Track.sha256 == digest))
                 if winner is not None:
                     return winner, True
                 raise
-            except Exception:
-                db.rollback()
-                media_path.unlink(missing_ok=True)
-                if cover_name:
-                    (self.settings.paths.cover_dir / cover_name).unlink(missing_ok=True)
-                raise
             db.refresh(track)
+            placement_path = None
+            cover_name = None
             return track, False
+        except Exception:
+            db.rollback()
+            if placement_path is not None:
+                placement_path.unlink(missing_ok=True)
+            if cover_name:
+                (self.settings.paths.cover_dir / cover_name).unlink(missing_ok=True)
+            raise
         finally:
+            if digest_lock is not None:
+                digest_lock.release()
             staged_path.unlink(missing_ok=True)
+            if normalized_path is not None:
+                normalized_path.unlink(missing_ok=True)
 
     def import_server_file(self, db: Session, source: Path) -> tuple[Track, bool]:
-        self._validate_extension(source.name)
+        self.validate_filename(source.name)
         if source.stat().st_size > self.settings.media.max_upload_bytes:
             raise ApiError(413, "file_too_large", f"{source.name} 超过 500 MiB 上限")
-        self.settings.paths.upload_temp_dir.mkdir(parents=True, exist_ok=True)
+        self.storage.upload_dir.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(
             prefix="scan-",
             suffix=source.suffix.lower(),
-            dir=self.settings.paths.upload_temp_dir,
+            dir=self.storage.upload_dir,
         )
         os.close(fd)
         staged = Path(temp_name)
@@ -298,16 +462,21 @@ class MediaService:
         tracks: list[Track] = []
         duplicates: list[Track] = []
         for existing in db.scalars(select(Track)).all():
-            media_path = self.settings.paths.media_dir / existing.storage_name
-            if not media_path.is_file() and existing.available:
+            try:
+                media_path = self.storage.track_path(existing)
+            except StorageUnavailable:
+                media_path = None
+            if (media_path is None or not media_path.is_file()) and existing.available:
                 existing.available = False
-                existing.unavailable_reason = "媒体文件不存在"
+                existing.unavailable_reason = "媒体文件不存在或存储位置未挂载"
                 existing.updated_at = utcnow()
                 unavailable += 1
             elif (
-                media_path.is_file()
+                media_path is not None
+                and media_path.is_file()
                 and not existing.available
-                and existing.unavailable_reason == "媒体文件不存在"
+                and existing.unavailable_reason
+                in {"媒体文件不存在", "媒体文件不存在或存储位置未挂载"}
             ):
                 try:
                     self._probe(media_path)

@@ -7,7 +7,7 @@ app:
   public_base_url: "https://radio.example.com"
 
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 8000
   workers: 1
   proxy_headers: true
@@ -17,8 +17,6 @@ server:
 
 paths:
   data_dir: "/opt/radio/data"
-  media_dir: "/opt/radio/data/media"
-  upload_temp_dir: "/opt/radio/data/tmp/uploads"
   cover_dir: "/opt/radio/data/covers"
   hls_dir: "/opt/radio/data/runtime/hls"
   log_dir: "/opt/radio/data/logs"
@@ -78,6 +76,33 @@ media:
     extract_embedded_cover: true
     allow_admin_edit: true
 
+uploads:
+  temp_dir: "/opt/radio/tmp"
+  queue_limit: 10
+  max_concurrent: 3
+  ready_lease_seconds: 120
+  heartbeat_interval_seconds: 5
+  heartbeat_timeout_seconds: 15
+  progress_checkpoint_bytes: 4194304
+  history_limit: 100
+
+storage:
+  locations:
+    - id: "primary"
+      root: "/opt/radio/data/media"
+      priority: 100
+      max_usage_percent: 90
+      enabled: true
+      create_if_missing: false
+    # For every additional mount, also extend RequiresMountsFor and
+    # ReadWritePaths in radio.service with that absolute root.
+    # - id: "secondary"
+    #   root: "/mnt/radio-secondary/media"
+    #   priority: 50
+    #   max_usage_percent: 85
+    #   enabled: true
+    #   create_if_missing: false
+
 ffmpeg:
   binary: "/usr/bin/ffmpeg"
   ffprobe_binary: "/usr/bin/ffprobe"
@@ -96,6 +121,7 @@ streaming:
     bitrate: "192k"
     sample_rate: 48000
     channels: 2
+    sample_bits: 32
   hls:
     segment_container: "mpegts"
     segment_duration_seconds: 4
