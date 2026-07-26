@@ -10,6 +10,14 @@ SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 UPLOAD_CLIENT_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
+def validate_library_name(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("音乐库名称不能包含控制字符")
+    if "/" in value or "\\" in value:
+        raise ValueError("音乐库名称不能包含路径分隔符")
+    return value
+
+
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -100,6 +108,44 @@ class TrackUpdate(ApiModel):
         if not (value.startswith("https://") or value.startswith("/api/covers/")):
             raise ValueError("封面 URL 必须使用 HTTPS 或本站封面路径")
         return value
+
+
+class TrackLibraryBatchMove(ApiModel):
+    source_library: str = Field(min_length=1, max_length=80)
+    target_library: str = Field(min_length=1, max_length=80)
+    track_ids: list[int] = Field(min_length=1, max_length=1000)
+
+    @field_validator("source_library", "target_library")
+    @classmethod
+    def library_name_format(cls, value: str) -> str:
+        return validate_library_name(value)
+
+    @field_validator("track_ids")
+    @classmethod
+    def unique_track_ids(cls, values: list[int]) -> list[int]:
+        if any(value <= 0 for value in values):
+            raise ValueError("曲目 ID 无效")
+        if len(set(values)) != len(values):
+            raise ValueError("曲目 ID 不能重复")
+        return values
+
+
+class MusicLibraryCreate(ApiModel):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def library_name_format(cls, value: str) -> str:
+        return validate_library_name(value)
+
+
+class MusicLibraryUpdate(ApiModel):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def library_name_format(cls, value: str) -> str:
+        return validate_library_name(value)
 
 
 class UploadReservationInput(ApiModel):

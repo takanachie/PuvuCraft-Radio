@@ -67,6 +67,7 @@ export interface TrackSummary {
 }
 
 export interface Track extends TrackSummary {
+  library_group?: string
   original_filename?: string | null
   file_size_bytes?: number | null
   sha256?: string | null
@@ -80,6 +81,40 @@ export interface Track extends TrackSummary {
   updated_at?: string
   unavailable_reason?: string | null
   referenced_by?: Array<{ id: EntityId; name: string }>
+}
+
+export interface TrackPage {
+  items: Track[]
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+  library_group: string
+  library_groups: string[]
+  available_count: number
+  unavailable_count: number
+}
+
+export interface TrackQuery {
+  page?: number
+  libraryGroup?: string
+  search?: string
+  availableOnly?: boolean
+  excludeChannelId?: EntityId
+}
+
+export interface TrackLibraryMoveResponse {
+  moved: number
+  source_library: string
+  target_library: string
+  library_groups: string[]
+}
+
+export interface MusicLibrary {
+  name: string
+  track_count: number
+  created_at?: string
+  updated_at?: string
 }
 
 export interface PlaybackState {

@@ -4,6 +4,7 @@ import type {
   ChannelInput,
   EntityId,
   MessageResponse,
+  MusicLibrary,
   PlaylistItem,
   RegistrationPayload,
   RegistrationResponse,
@@ -11,6 +12,9 @@ import type {
   SetupStatus,
   Track,
   TrackInput,
+  TrackLibraryMoveResponse,
+  TrackPage,
+  TrackQuery,
   UploadJob,
   UploadPreflightResponse,
   UploadQueueSnapshot,
@@ -108,8 +112,62 @@ export const api = {
       await request(`/api/admin/channels/${id(channelId)}`, { method: 'DELETE' })
     },
 
-    async tracks(): Promise<Track[]> {
-      return unwrapList<Track>(await request<unknown>('/api/admin/tracks'), ['tracks'])
+    async tracks(options: TrackQuery = {}): Promise<TrackPage> {
+      const params = new URLSearchParams()
+      if (options.page !== undefined) params.set('page', String(options.page))
+      if (options.libraryGroup !== undefined) params.set('library_group', options.libraryGroup)
+      if (options.search?.trim()) params.set('search', options.search.trim())
+      if (options.availableOnly) params.set('available_only', 'true')
+      if (options.excludeChannelId !== undefined) {
+        params.set('exclude_channel_id', String(options.excludeChannelId))
+      }
+      const query = params.toString()
+      return request<TrackPage>(`/api/admin/tracks${query ? `?${query}` : ''}`)
+    },
+    async moveTracksToLibrary(
+      sourceLibrary: string,
+      targetLibrary: string,
+      trackIds: EntityId[],
+    ): Promise<TrackLibraryMoveResponse> {
+      return request<TrackLibraryMoveResponse>('/api/admin/tracks/library', {
+        method: 'PATCH',
+        json: {
+          source_library: sourceLibrary,
+          target_library: targetLibrary,
+          track_ids: trackIds,
+        },
+      })
+    },
+    async trackLibraries(): Promise<MusicLibrary[]> {
+      return unwrapList<MusicLibrary>(
+        await request<unknown>('/api/admin/track-libraries'),
+        ['libraries'],
+      )
+    },
+    async createTrackLibrary(name: string): Promise<MusicLibrary | undefined> {
+      const payload = await request<unknown>('/api/admin/track-libraries', {
+        method: 'POST',
+        json: { name },
+      })
+      return unwrapEntity<MusicLibrary | undefined>(payload, ['library'])
+    },
+    async renameTrackLibrary(
+      currentName: string,
+      name: string,
+    ): Promise<MusicLibrary | undefined> {
+      const payload = await request<unknown>(
+        `/api/admin/track-libraries/${encodeURIComponent(currentName)}`,
+        {
+          method: 'PATCH',
+          json: { name },
+        },
+      )
+      return unwrapEntity<MusicLibrary | undefined>(payload, ['library'])
+    },
+    async deleteTrackLibrary(name: string): Promise<void> {
+      await request(`/api/admin/track-libraries/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+      })
     },
     async uploadQueue(): Promise<UploadQueueSnapshot> {
       return request<UploadQueueSnapshot>('/api/admin/uploads')

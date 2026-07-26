@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../api'
 import { getCookie, isApiError, userFacingError } from '../../api/client'
 import type {
@@ -69,6 +69,20 @@ const saving = ref(false)
 const error = ref('')
 const notice = ref('')
 const search = ref('')
+const libraryGroup = ref('default')
+const libraryGroups = ref<string[]>(['default'])
+const trackPage = ref(1)
+const trackPageSize = ref(10)
+const trackTotal = ref(0)
+const trackTotalPages = ref(1)
+const availableCount = ref(0)
+const unavailableCount = ref(0)
+const selectedTrackIds = ref<Set<string>>(new Set())
+const moveTargetLibrary = ref('')
+const movingTracks = ref(false)
+const newLibraryName = ref('')
+const renamedLibraryName = ref('default')
+const librarySaving = ref(false)
 const selectedFiles = ref<File[]>([])
 const submittedUploads = ref<SubmittedUploadTask[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -108,18 +122,20 @@ let libraryRefreshRunning = false
 let preflightRequest = 0
 let submittedRetryTimer: number | undefined
 let submittedRetryAttempt = 0
+let trackSearchTimer: number | undefined
 let leaving = false
 
 const editingTrack = computed(() => tracks.value.find((track) => String(track.id) === String(editingId.value)) || null)
-const filteredTracks = computed(() => {
-  const needle = search.value.trim().toLocaleLowerCase()
-  if (!needle) return tracks.value
-  return tracks.value.filter((track) =>
-    [track.title, track.artist, track.album, track.original_filename]
-      .some((value) => value?.toLocaleLowerCase().includes(needle)),
-  )
-})
-const availableCount = computed(() => tracks.value.filter((track) => track.available !== false).length)
+const allPageTracksSelected = computed(() =>
+  tracks.value.length > 0
+  && tracks.value.every((track) => selectedTrackIds.value.has(String(track.id))),
+)
+const targetLibraryGroups = computed(() =>
+  libraryGroups.value.filter((group) => group !== libraryGroup.value),
+)
+const currentLibraryTrackCount = computed(() =>
+  availableCount.value + unavailableCount.value,
+)
 const visibleUploadJobs = computed(() =>
   uploadQueue.value.jobs.filter((job) => VISIBLE_UPLOADS.has(job.status)),
 )
@@ -164,25 +180,47 @@ function clearMessages() {
   notice.value = ''
 }
 
-async function load(preserveSelection = true, background = false) {
+async function load(preserveSelection = true, background = false, page = trackPage.value) {
   const requestId = ++trackRequest
+  const requestedLibrary = libraryGroup.value
+  const requestedSearch = search.value.trim()
   if (!background) {
     visibleTrackRequest = requestId
     loading.value = true
     error.value = ''
   }
   try {
-    const result = await api.admin.tracks()
-    if (requestId < appliedTrackRequest) return
+    const result = await api.admin.tracks({
+      page,
+      libraryGroup: requestedLibrary,
+      search: requestedSearch,
+    })
+    if (
+      requestId < appliedTrackRequest
+      || libraryGroup.value !== requestedLibrary
+      || search.value.trim() !== requestedSearch
+    ) return
     appliedTrackRequest = requestId
-    tracks.value = result
+    tracks.value = result.items
+    trackPage.value = result.page
+    trackPageSize.value = result.page_size
+    trackTotal.value = result.total
+    trackTotalPages.value = result.total_pages
+    libraryGroups.value = result.library_groups
+    availableCount.value = result.available_count
+    unavailableCount.value = result.unavailable_count
     if (preserveSelection && editingId.value !== null) {
       const updated = tracks.value.find((track) => String(track.id) === String(editingId.value))
       if (updated) beginEdit(updated)
       else editingId.value = null
     }
   } catch (cause) {
-    if (!background && requestId >= appliedTrackRequest) {
+    if (
+      !background
+      && requestId >= appliedTrackRequest
+      && libraryGroup.value === requestedLibrary
+      && search.value.trim() === requestedSearch
+    ) {
       error.value = userFacingError(cause, '无法读取音乐库')
     }
   } finally {
@@ -190,6 +228,186 @@ async function load(preserveSelection = true, background = false) {
       loading.value = false
       void runPendingLibraryRefresh()
     }
+  }
+}
+
+function changeLibraryGroup() {
+  cancelTrackSearch()
+  cancelEdit()
+  selectedTrackIds.value = new Set()
+  moveTargetLibrary.value = ''
+  trackPage.value = 1
+  void load(false, false, 1)
+}
+
+function cancelTrackSearch() {
+  if (trackSearchTimer === undefined) return
+  window.clearTimeout(trackSearchTimer)
+  trackSearchTimer = undefined
+}
+
+function normalizeLibraryGroups(groups: string[]): string[] {
+  const unique = [...new Set(groups)]
+  unique.sort((left, right) => {
+    if (left === 'default') return -1
+    if (right === 'default') return 1
+    return left.localeCompare(right)
+  })
+  return unique
+}
+
+async function createLibrary() {
+  const name = newLibraryName.value.trim()
+  if (!name || librarySaving.value) return
+  clearMessages()
+  librarySaving.value = true
+  try {
+    const created = await api.admin.createTrackLibrary(name)
+    const resolvedName = created?.name || name
+    libraryGroups.value = normalizeLibraryGroups([...libraryGroups.value, resolvedName])
+    libraryGroup.value = resolvedName
+    renamedLibraryName.value = resolvedName
+    newLibraryName.value = ''
+    selectedTrackIds.value = new Set()
+    moveTargetLibrary.value = ''
+    cancelEdit()
+    trackPage.value = 1
+    await load(false, false, 1)
+    notice.value = `音乐库“${resolvedName}”已创建。`
+  } catch (cause) {
+    error.value = userFacingError(cause, '无法创建音乐库')
+  } finally {
+    librarySaving.value = false
+  }
+}
+
+async function renameLibrary() {
+  const currentName = libraryGroup.value
+  const name = renamedLibraryName.value.trim()
+  if (
+    currentName === 'default'
+    || !name
+    || name === currentName
+    || librarySaving.value
+    || loading.value
+  ) return
+  clearMessages()
+  librarySaving.value = true
+  try {
+    const renamed = await api.admin.renameTrackLibrary(currentName, name)
+    const resolvedName = renamed?.name || name
+    libraryGroups.value = normalizeLibraryGroups(
+      libraryGroups.value.map((group) => group === currentName ? resolvedName : group),
+    )
+    libraryGroup.value = resolvedName
+    renamedLibraryName.value = resolvedName
+    if (moveTargetLibrary.value === currentName) moveTargetLibrary.value = resolvedName
+    selectedTrackIds.value = new Set()
+    cancelEdit()
+    trackPage.value = 1
+    await load(false, false, 1)
+    notice.value = `音乐库“${currentName}”已重命名为“${resolvedName}”。`
+  } catch (cause) {
+    error.value = userFacingError(cause, '无法重命名音乐库')
+  } finally {
+    librarySaving.value = false
+  }
+}
+
+async function deleteLibrary() {
+  const name = libraryGroup.value
+  if (
+    name === 'default'
+    || currentLibraryTrackCount.value > 0
+    || librarySaving.value
+    || loading.value
+  ) return
+  if (!window.confirm(`删除空音乐库“${name}”？`)) return
+  clearMessages()
+  librarySaving.value = true
+  try {
+    await api.admin.deleteTrackLibrary(name)
+    libraryGroups.value = normalizeLibraryGroups(
+      libraryGroups.value.filter((group) => group !== name),
+    )
+    libraryGroup.value = 'default'
+    renamedLibraryName.value = 'default'
+    selectedTrackIds.value = new Set()
+    moveTargetLibrary.value = ''
+    cancelEdit()
+    trackPage.value = 1
+    await load(false, false, 1)
+    notice.value = `空音乐库“${name}”已删除。`
+  } catch (cause) {
+    error.value = userFacingError(cause, '无法删除音乐库')
+  } finally {
+    librarySaving.value = false
+  }
+}
+
+function goToTrackPage(page: number) {
+  const target = Math.min(Math.max(1, page), trackTotalPages.value)
+  if (target === trackPage.value || loading.value) return
+  cancelEdit()
+  void load(false, false, target)
+}
+
+function toggleTrackSelection(track: Track, event: Event) {
+  const selected = new Set(selectedTrackIds.value)
+  const trackId = String(track.id)
+  if ((event.target as HTMLInputElement).checked) selected.add(trackId)
+  else selected.delete(trackId)
+  selectedTrackIds.value = selected
+}
+
+function togglePageTracks(event: Event) {
+  const selected = new Set(selectedTrackIds.value)
+  const checked = (event.target as HTMLInputElement).checked
+  for (const track of tracks.value) {
+    if (checked) selected.add(String(track.id))
+    else selected.delete(String(track.id))
+  }
+  selectedTrackIds.value = selected
+}
+
+function clearSelectedTracks() {
+  selectedTrackIds.value = new Set()
+}
+
+async function moveSelectedTracks() {
+  const target = moveTargetLibrary.value.trim()
+  if (!selectedTrackIds.value.size || movingTracks.value) return
+  if (!target) {
+    error.value = '请选择目标音乐库。'
+    return
+  }
+  if (target === libraryGroup.value) {
+    error.value = '目标音乐库不能与当前音乐库相同。'
+    return
+  }
+  if (!window.confirm(
+    `将所选 ${selectedTrackIds.value.size} 首曲目从“${libraryGroup.value}”迁入“${target}”？`,
+  )) return
+
+  clearMessages()
+  movingTracks.value = true
+  const movedCount = selectedTrackIds.value.size
+  try {
+    const result = await api.admin.moveTracksToLibrary(
+      libraryGroup.value,
+      target,
+      [...selectedTrackIds.value].map(Number),
+    )
+    libraryGroups.value = result.library_groups
+    selectedTrackIds.value = new Set()
+    moveTargetLibrary.value = ''
+    cancelEdit()
+    await load(false)
+    notice.value = `已将 ${movedCount} 首曲目迁入“${target}”。`
+  } catch (cause) {
+    error.value = userFacingError(cause, '无法迁移所选曲目')
+  } finally {
+    movingTracks.value = false
   }
 }
 
@@ -918,6 +1136,9 @@ async function remove(track: Track) {
   try {
     await api.admin.deleteTrack(track.id)
     if (String(editingId.value) === String(track.id)) editingId.value = null
+    const selected = new Set(selectedTrackIds.value)
+    selected.delete(String(track.id))
+    selectedTrackIds.value = selected
     await load()
     notice.value = '曲目已从音乐库删除。'
   } catch (cause) {
@@ -926,6 +1147,20 @@ async function remove(track: Track) {
     saving.value = false
   }
 }
+
+watch(search, () => {
+  cancelTrackSearch()
+  trackSearchTimer = window.setTimeout(() => {
+    trackSearchTimer = undefined
+    cancelEdit()
+    trackPage.value = 1
+    void load(false, false, 1)
+  }, 250)
+})
+
+watch(libraryGroup, (value) => {
+  renamedLibraryName.value = value
+})
 
 onMounted(() => {
   void load()
@@ -940,6 +1175,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', expireOwnedUploads)
   eventSource?.close()
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
+  cancelTrackSearch()
   clearSubmittedRetry()
 })
 </script>
@@ -954,7 +1190,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="metric-pair">
         <div><strong>{{ availableCount }}</strong><span>AVAILABLE</span></div>
-        <div><strong>{{ tracks.length - availableCount }}</strong><span>UNAVAILABLE</span></div>
+        <div><strong>{{ unavailableCount }}</strong><span>UNAVAILABLE</span></div>
       </div>
     </header>
 
@@ -1327,7 +1563,94 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
+    <section class="library-management" aria-labelledby="library-management-title">
+      <header>
+        <div>
+          <span class="eyebrow">Library registry</span>
+          <h3 id="library-management-title">音乐库管理</h3>
+          <p>音乐库是独立数据库记录；新建空库后，才能将曲目迁入其中。</p>
+        </div>
+      </header>
+      <form class="library-management__form" @submit.prevent="createLibrary">
+        <div class="field">
+          <label for="new-track-library">添加音乐库</label>
+          <input
+            id="new-track-library"
+            v-model="newLibraryName"
+            type="text"
+            maxlength="80"
+            placeholder="输入新音乐库名称"
+            :disabled="librarySaving"
+          />
+        </div>
+        <button
+          class="button button--primary"
+          type="submit"
+          :disabled="librarySaving || !newLibraryName.trim()"
+        >
+          添加音乐库
+        </button>
+      </form>
+      <div class="library-management__current">
+        <div class="field">
+          <label for="rename-track-library">当前音乐库名称</label>
+          <input
+            id="rename-track-library"
+            v-model="renamedLibraryName"
+            type="text"
+            maxlength="80"
+            :disabled="librarySaving || loading || libraryGroup === 'default'"
+          />
+        </div>
+        <div class="library-management__actions">
+          <button
+            class="button button--quiet"
+            type="button"
+            :disabled="
+              librarySaving
+              || loading
+              || libraryGroup === 'default'
+              || !renamedLibraryName.trim()
+              || renamedLibraryName.trim() === libraryGroup
+            "
+            @click="renameLibrary"
+          >
+            重命名当前库
+          </button>
+          <button
+            class="button button--danger"
+            type="button"
+            :disabled="
+              librarySaving
+              || loading
+              || libraryGroup === 'default'
+              || currentLibraryTrackCount > 0
+            "
+            @click="deleteLibrary"
+          >
+            删除当前空库
+          </button>
+        </div>
+        <small v-if="libraryGroup === 'default'">default 是系统音乐库，不能重命名或删除。</small>
+        <small v-else-if="currentLibraryTrackCount > 0">
+          当前库还有 {{ currentLibraryTrackCount }} 首曲目；全部迁走后才能删除。
+        </small>
+        <small v-else>当前音乐库为空，可以安全删除。</small>
+      </div>
+    </section>
+
     <div class="library-toolbar">
+      <div class="field field--library">
+        <label for="track-library">所属音乐库</label>
+        <select
+          id="track-library"
+          v-model="libraryGroup"
+          :disabled="loading || movingTracks || librarySaving"
+          @change="changeLibraryGroup"
+        >
+          <option v-for="group in libraryGroups" :key="group" :value="group">{{ group }}</option>
+        </select>
+      </div>
       <div class="field field--search">
         <label for="track-search">搜索音乐库</label>
         <input id="track-search" v-model="search" type="search" placeholder="标题 / 艺人 / 专辑 / 文件名" />
@@ -1337,16 +1660,46 @@ onBeforeUnmount(() => {
 
     <div class="data-frame">
       <table class="console-table track-table">
-        <thead><tr><th>曲目</th><th>专辑</th><th>时长</th><th>文件</th><th>状态</th><th class="align-right">操作</th></tr></thead>
+        <thead>
+          <tr>
+            <th class="track-select-cell">
+              <input
+                type="checkbox"
+                aria-label="选择当前页全部曲目"
+                :checked="allPageTracksSelected"
+                :disabled="!tracks.length || movingTracks"
+                @change="togglePageTracks"
+              />
+            </th>
+            <th>曲目</th><th>音乐库</th><th>专辑</th><th>时长</th><th>文件</th><th>状态</th><th class="align-right">操作</th>
+          </tr>
+        </thead>
         <tbody>
-          <tr v-if="loading"><td colspan="6" class="table-message">正在索引音乐库…</td></tr>
-          <tr v-else-if="!filteredTracks.length"><td colspan="6" class="table-message">音乐库中没有匹配的曲目。</td></tr>
+          <tr v-if="loading"><td colspan="8" class="table-message">正在查询音乐库…</td></tr>
+          <tr v-else-if="!tracks.length"><td colspan="8" class="table-message">音乐库中没有匹配的曲目。</td></tr>
           <template v-else>
-            <tr v-for="track in filteredTracks" :key="track.id" :class="{ unavailable: track.available === false }">
+            <tr
+              v-for="track in tracks"
+              :key="track.id"
+              :class="{
+                unavailable: track.available === false,
+                selected: selectedTrackIds.has(String(track.id)),
+              }"
+            >
+              <td data-label="选择" class="track-select-cell">
+                <input
+                  type="checkbox"
+                  :aria-label="`选择 ${track.title}`"
+                  :checked="selectedTrackIds.has(String(track.id))"
+                  :disabled="movingTracks"
+                  @change="toggleTrackSelection(track, $event)"
+                />
+              </td>
               <td data-label="曲目" class="track-cell">
                 <span class="mini-cover"><img v-if="track.cover_url" :src="track.cover_url" alt="" /><i v-else aria-hidden="true">♪</i></span>
                 <span><strong>{{ track.title }}</strong><small>{{ track.artist || '未知艺人' }}</small></span>
               </td>
+              <td data-label="音乐库"><span class="mono-label">{{ track.library_group || 'default' }}</span></td>
               <td data-label="专辑">{{ track.album || '—' }}</td>
               <td data-label="时长" class="mono-label">{{ formatDuration(track.duration_seconds) }}</td>
               <td data-label="文件">
@@ -1365,6 +1718,74 @@ onBeforeUnmount(() => {
         </tbody>
       </table>
     </div>
+
+    <div class="library-pagination">
+      <span>
+        第 {{ trackPage }} / {{ trackTotalPages }} 页 · 当前 {{ tracks.length }} 条 ·
+        共 {{ trackTotal }} 条匹配结果 · 每页固定 {{ trackPageSize }} 条
+      </span>
+      <div>
+        <button
+          class="button button--quiet button--small"
+          type="button"
+          :disabled="loading || trackPage <= 1"
+          @click="goToTrackPage(trackPage - 1)"
+        >
+          上一页
+        </button>
+        <button
+          class="button button--quiet button--small"
+          type="button"
+          :disabled="loading || trackPage >= trackTotalPages"
+          @click="goToTrackPage(trackPage + 1)"
+        >
+          下一页
+        </button>
+      </div>
+    </div>
+
+    <section class="library-batch-move" aria-labelledby="library-batch-move-title">
+      <div>
+        <span class="eyebrow">Library transfer</span>
+        <strong id="library-batch-move-title">批量迁移所属音乐库</strong>
+        <small>当前已从“{{ libraryGroup }}”跨页选择 {{ selectedTrackIds.size }} 首曲目。</small>
+      </div>
+      <div class="field">
+        <label for="target-track-library">目标音乐库</label>
+        <select
+          id="target-track-library"
+          v-model="moveTargetLibrary"
+          :disabled="movingTracks"
+        >
+          <option value="">选择已创建的目标音乐库</option>
+          <option
+            v-for="group in targetLibraryGroups"
+            :key="group"
+            :value="group"
+          >
+            {{ group }}
+          </option>
+        </select>
+      </div>
+      <div class="library-batch-move__actions">
+        <button
+          class="button button--quiet button--small"
+          type="button"
+          :disabled="movingTracks || !selectedTrackIds.size"
+          @click="clearSelectedTracks"
+        >
+          清空选择
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="movingTracks || !selectedTrackIds.size || !moveTargetLibrary.trim()"
+          @click="moveSelectedTracks"
+        >
+          {{ movingTracks ? '正在迁移…' : `迁移所选 ${selectedTrackIds.size} 首` }}
+        </button>
+      </div>
+    </section>
 
     <section v-if="editingTrack" class="drawer-editor" aria-labelledby="track-editor-title">
       <header>

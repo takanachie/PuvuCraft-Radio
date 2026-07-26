@@ -6,7 +6,7 @@ from datetime import timedelta
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from backend.app.models import AuditEvent, Track, UploadJob, utcnow
+from backend.app.models import AuditEvent, MusicLibrary, Track, UploadJob, utcnow
 
 from .conftest import csrf_headers
 
@@ -131,13 +131,16 @@ def test_page_close_expires_all_client_jobs(initialized_admin: TestClient) -> No
     assert all(job["error_code"] == "page_closed" for job in jobs)
 
 
-def test_similar_name_requires_confirmation_before_reservation(
+def test_similar_name_search_is_global_across_music_libraries(
     initialized_admin: TestClient,
 ) -> None:
     client = initialized_admin
     with client.app.state.database.session_factory.begin() as db:
+        db.add(MusicLibrary(name="archive"))
+        db.flush()
         db.add(
             Track(
+                library_group="archive",
                 storage_id="primary",
                 storage_name="existing-track.flac",
                 original_filename="01 - Example Artist - Example Song.flac",

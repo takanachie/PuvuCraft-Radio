@@ -91,10 +91,34 @@ class Channel(Base):
     )
 
 
+class MusicLibrary(Base):
+    __tablename__ = "music_libraries"
+
+    name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    tracks: Mapped[list["Track"]] = relationship(
+        back_populates="library",
+        passive_updates=True,
+    )
+
+
 class Track(Base):
     __tablename__ = "tracks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    library_group: Mapped[str] = mapped_column(
+        String(80),
+        ForeignKey(
+            "music_libraries.name",
+            ondelete="RESTRICT",
+            onupdate="CASCADE",
+        ),
+        default="default",
+        server_default="default",
+        index=True,
+    )
     storage_id: Mapped[str] = mapped_column(String(80), default="primary", index=True)
     storage_name: Mapped[str] = mapped_column(String(255), unique=True)
     original_filename: Mapped[str] = mapped_column(String(512))
@@ -119,6 +143,10 @@ class Track(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     playlist_items: Mapped[list[PlaylistItem]] = relationship(back_populates="track")
+    library: Mapped["MusicLibrary"] = relationship(
+        back_populates="tracks",
+        passive_updates=True,
+    )
 
 
 class UploadJob(Base):

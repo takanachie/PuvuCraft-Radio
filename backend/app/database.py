@@ -10,7 +10,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import Settings
-from .models import Base, Channel, PlaybackState, User
+from .models import Base, Channel, MusicLibrary, PlaybackState, User
 
 
 class Database:
@@ -49,6 +49,7 @@ class Database:
             self._verify_migration_revision()
         else:
             Base.metadata.create_all(self.engine)
+        self._seed_music_libraries()
         self._seed_channels()
 
     def _verify_migration_revision(self) -> None:
@@ -64,6 +65,11 @@ class Database:
                 "database migration is not current; run `alembic upgrade head` "
                 f"(database={sorted(current)}, expected={sorted(expected)})"
             )
+
+    def _seed_music_libraries(self) -> None:
+        with self.session_factory.begin() as session:
+            if session.get(MusicLibrary, "default") is None:
+                session.add(MusicLibrary(name="default"))
 
     def _seed_channels(self) -> None:
         with self.session_factory.begin() as session:

@@ -81,6 +81,7 @@ class MediaService:
         threshold: float = NAME_SIMILARITY_THRESHOLD,
         limit: int = NAME_SIMILARITY_LIMIT,
     ) -> list[dict[str, object]]:
+        # Library membership organizes the catalog; duplicate screening is global.
         tracks = list(db.scalars(select(Track)).all())
         return self._similar_tracks_from(
             filename,
@@ -97,6 +98,7 @@ class MediaService:
         threshold: float = NAME_SIMILARITY_THRESHOLD,
         limit: int = NAME_SIMILARITY_LIMIT,
     ) -> dict[str, list[dict[str, object]]]:
+        # Keep batch preflight global for the same reason as the single-file check.
         tracks = list(db.scalars(select(Track)).all())
         return {
             filename: self._similar_tracks_from(
@@ -481,6 +483,7 @@ class MediaService:
             cover_name = self._write_cover(metadata)
             now = utcnow()
             track = Track(
+                library_group="default",
                 storage_id=placement.storage_id,
                 storage_name=placement.storage_name,
                 original_filename=Path(original_filename).name,

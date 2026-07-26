@@ -55,6 +55,7 @@ def track_dict(track: Track) -> dict[str, object]:
         "channels": track.channels,
         "bits_per_sample": track.bits_per_sample,
         "normalized": track.normalized,
+        "library_group": track.library_group,
         "storage_id": track.storage_id,
         "cover_url": cover_url,
         "available": track.available,

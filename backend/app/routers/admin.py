@@ -6,8 +6,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request, UploadFile
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Query, Request, UploadFile
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
@@ -17,6 +17,7 @@ from ..errors import ApiError
 from ..models import (
     AuditEvent,
     Channel,
+    MusicLibrary,
     PlaybackState,
     PlaylistItem,
     Track,
@@ -27,22 +28,26 @@ from ..models import (
 from ..schemas import (
     ChannelCreate,
     ChannelUpdate,
+    MusicLibraryCreate,
+    MusicLibraryUpdate,
     PlaylistAdd,
     PlaylistBatchAdd,
     PlaylistItemUpdate,
     PlaylistReorder,
+    TrackLibraryBatchMove,
     TrackUpdate,
     UserRoleUpdate,
     UserUpdate,
 )
 from ..security import AuthService
-from ..serializers import channel_dict, playlist_item_dict, track_dict, user_dict
+from ..serializers import channel_dict, iso, playlist_item_dict, track_dict, user_dict
 from ..services.playback import ChannelCommand
 from ..services.storage import StorageUnavailable
 from ..services.uploads import CAPACITY_STATUSES
 
 router = APIRouter(prefix="/api/admin")
 logger = logging.getLogger(__name__)
+TRACK_LIBRARY_PAGE_SIZE = 10
 
 
 def unlink_after_commit(path: Path) -> None:
@@ -328,21 +333,227 @@ def _track_with_references(track: Track) -> dict[str, object]:
     return result
 
 
-@router.get("/tracks")
-def list_tracks(
+def _library_groups(db: Session) -> list[str]:
+    groups = list(
+        db.scalars(
+            select(MusicLibrary.name).order_by(MusicLibrary.name.asc())
+        ).all()
+    )
+    if "default" in groups:
+        groups.remove("default")
+    return ["default", *groups]
+
+
+def _music_library_dict(db: Session, library: MusicLibrary) -> dict[str, object]:
+    track_count = (
+        db.scalar(
+            select(func.count(Track.id)).where(Track.library_group == library.name)
+        )
+        or 0
+    )
+    return {
+        "name": library.name,
+        "track_count": track_count,
+        "created_at": iso(library.created_at),
+        "updated_at": iso(library.updated_at),
+    }
+
+
+@router.get("/track-libraries")
+def list_music_libraries(
     _admin: User = Depends(require_admin_read),
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
+    libraries = db.scalars(
+        select(MusicLibrary).order_by(MusicLibrary.name.asc())
+    ).all()
+    libraries.sort(key=lambda library: (library.name != "default", library.name))
+    return [_music_library_dict(db, library) for library in libraries]
+
+
+@router.post("/track-libraries", status_code=201)
+def create_music_library(
+    payload: MusicLibraryCreate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    if db.get(MusicLibrary, payload.name) is not None:
+        raise ApiError(409, "music_library_exists", "同名音乐库已经存在")
+    library = MusicLibrary(name=payload.name)
+    db.add(library)
+    audit(
+        db,
+        admin,
+        "music_library.created",
+        "music_library",
+        payload.name,
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(409, "music_library_exists", "同名音乐库已经存在") from exc
+    db.refresh(library)
+    return {"library": _music_library_dict(db, library)}
+
+
+@router.patch("/track-libraries/{library_name}")
+def rename_music_library(
+    library_name: str,
+    payload: MusicLibraryUpdate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    library = db.get(MusicLibrary, library_name)
+    if library is None:
+        raise ApiError(404, "music_library_not_found", "音乐库不存在")
+    if library_name == "default":
+        raise ApiError(409, "default_library_protected", "default 音乐库不能重命名")
+    if payload.name == library_name:
+        return {"library": _music_library_dict(db, library)}
+    if db.get(MusicLibrary, payload.name) is not None:
+        raise ApiError(409, "music_library_exists", "同名音乐库已经存在")
+
+    now = utcnow()
+    try:
+        db.execute(
+            update(MusicLibrary)
+            .where(MusicLibrary.name == library_name)
+            .values(name=payload.name, updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        db.execute(
+            update(Track)
+            .where(Track.library_group == payload.name)
+            .values(updated_at=now)
+        )
+        audit(
+            db,
+            admin,
+            "music_library.renamed",
+            "music_library",
+            payload.name,
+            {"from": library_name, "to": payload.name},
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(409, "music_library_exists", "同名音乐库已经存在") from exc
+    renamed = db.get(MusicLibrary, payload.name)
+    if renamed is None:
+        raise ApiError(500, "music_library_rename_failed", "音乐库重命名失败")
+    return {"library": _music_library_dict(db, renamed)}
+
+
+@router.delete("/track-libraries/{library_name}", status_code=204)
+def delete_music_library(
+    library_name: str,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> None:
+    library = db.get(MusicLibrary, library_name)
+    if library is None:
+        raise ApiError(404, "music_library_not_found", "音乐库不存在")
+    if library_name == "default":
+        raise ApiError(409, "default_library_protected", "default 音乐库不能删除")
+    track_count = (
+        db.scalar(
+            select(func.count(Track.id)).where(Track.library_group == library_name)
+        )
+        or 0
+    )
+    if track_count:
+        raise ApiError(409, "music_library_not_empty", "音乐库非空，请先迁移其中的曲目")
+    audit(
+        db,
+        admin,
+        "music_library.deleted",
+        "music_library",
+        library_name,
+    )
+    db.delete(library)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "music_library_not_empty",
+            "音乐库非空，请先迁移其中的曲目",
+        ) from exc
+
+
+@router.get("/tracks")
+def list_tracks(
+    page: int = Query(default=1, ge=1),
+    library_group: str = Query(default="default", min_length=1, max_length=80),
+    search: str = Query(default="", max_length=512),
+    available_only: bool = Query(default=False),
+    exclude_channel_id: int | None = Query(default=None, ge=1),
+    _admin: User = Depends(require_admin_read),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    if db.get(MusicLibrary, library_group) is None:
+        raise ApiError(404, "music_library_not_found", "音乐库不存在")
+    filters = [Track.library_group == library_group]
+    search = search.strip()
+    if search:
+        filters.append(
+            or_(
+                Track.title.icontains(search, autoescape=True),
+                Track.artist.icontains(search, autoescape=True),
+                Track.album.icontains(search, autoescape=True),
+                Track.original_filename.icontains(search, autoescape=True),
+            )
+        )
+    if available_only:
+        filters.append(Track.available.is_(True))
+    if exclude_channel_id is not None:
+        filters.append(
+            ~Track.playlist_items.any(PlaylistItem.channel_id == exclude_channel_id)
+        )
+
+    total = db.scalar(select(func.count(Track.id)).where(*filters)) or 0
+    total_pages = max(1, (total + TRACK_LIBRARY_PAGE_SIZE - 1) // TRACK_LIBRARY_PAGE_SIZE)
+    resolved_page = min(page, total_pages)
     tracks = (
         db.scalars(
             select(Track)
             .options(selectinload(Track.playlist_items).joinedload(PlaylistItem.channel))
-            .order_by(Track.created_at.desc())
+            .where(*filters)
+            .order_by(Track.created_at.desc(), Track.id.desc())
+            .offset((resolved_page - 1) * TRACK_LIBRARY_PAGE_SIZE)
+            .limit(TRACK_LIBRARY_PAGE_SIZE)
         )
         .unique()
         .all()
     )
-    return [_track_with_references(track) for track in tracks]
+    library_total = (
+        db.scalar(
+            select(func.count(Track.id)).where(Track.library_group == library_group)
+        )
+        or 0
+    )
+    available_count = (
+        db.scalar(
+            select(func.count(Track.id)).where(
+                Track.library_group == library_group,
+                Track.available.is_(True),
+            )
+        )
+        or 0
+    )
+    return {
+        "items": [_track_with_references(track) for track in tracks],
+        "page": resolved_page,
+        "page_size": TRACK_LIBRARY_PAGE_SIZE,
+        "total": total,
+        "total_pages": total_pages,
+        "library_group": library_group,
+        "library_groups": _library_groups(db),
+        "available_count": available_count,
+        "unavailable_count": library_total - available_count,
+    }
 
 
 @router.post("/tracks/scan")
@@ -363,6 +574,64 @@ def scan_tracks(
         **{key: result[key] for key in ("examined", "imported", "skipped", "unavailable")},
         "tracks": [track_dict(track) for track in result["tracks"]],
         "duplicates": [track_dict(track) for track in result["duplicates"]],
+    }
+
+
+@router.patch("/tracks/library")
+def move_tracks_to_library(
+    payload: TrackLibraryBatchMove,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    if payload.source_library == payload.target_library:
+        raise ApiError(409, "same_track_library", "源音乐库与目标音乐库不能相同")
+    if db.get(MusicLibrary, payload.source_library) is None:
+        raise ApiError(404, "source_music_library_not_found", "源音乐库不存在")
+    if db.get(MusicLibrary, payload.target_library) is None:
+        raise ApiError(404, "target_music_library_not_found", "目标音乐库不存在")
+
+    now = utcnow()
+    moved = 0
+    for offset in range(0, len(payload.track_ids), 400):
+        track_ids = payload.track_ids[offset : offset + 400]
+        result = db.execute(
+            update(Track)
+            .where(
+                Track.id.in_(track_ids),
+                Track.library_group == payload.source_library,
+            )
+            .values(library_group=payload.target_library, updated_at=now)
+        )
+        moved += result.rowcount or 0
+    if moved != len(payload.track_ids):
+        db.rollback()
+        found_ids: set[int] = set()
+        for offset in range(0, len(payload.track_ids), 400):
+            track_ids = payload.track_ids[offset : offset + 400]
+            found_ids.update(db.scalars(select(Track.id).where(Track.id.in_(track_ids))).all())
+        if len(found_ids) != len(payload.track_ids):
+            raise ApiError(404, "track_not_found", "所选曲目中包含不存在的记录")
+        raise ApiError(409, "track_library_changed", "部分曲目的所属音乐库已经发生变化")
+
+    audit(
+        db,
+        admin,
+        "track.library_moved",
+        "track_library",
+        payload.target_library,
+        {
+            "source_library": payload.source_library,
+            "target_library": payload.target_library,
+            "track_ids": payload.track_ids,
+            "count": moved,
+        },
+    )
+    db.commit()
+    return {
+        "moved": moved,
+        "source_library": payload.source_library,
+        "target_library": payload.target_library,
+        "library_groups": _library_groups(db),
     }
 
 
