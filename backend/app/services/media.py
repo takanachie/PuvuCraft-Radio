@@ -5,13 +5,16 @@ import contextlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import unicodedata
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from mutagen import File as MutagenFile
@@ -46,6 +49,8 @@ class ExtractedMetadata:
 
 
 StatusCallback = Callable[[str], None]
+NAME_SIMILARITY_THRESHOLD = 0.82
+NAME_SIMILARITY_LIMIT = 5
 
 
 class MediaService:
@@ -59,6 +64,61 @@ class MediaService:
         if extension not in self.settings.media.allowed_extensions:
             raise ApiError(415, "unsupported_media", "不支持该音频文件格式")
         return extension
+
+    @staticmethod
+    def _normalized_name(value: str, *, strip_extension: bool = False) -> str:
+        text = Path(value).stem if strip_extension else value
+        text = unicodedata.normalize("NFKC", text).casefold()
+        text = re.sub(r"^\s*\d{1,3}(?:\s*[-_.、]\s*|\s+)", "", text)
+        text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
+        return " ".join(text.split())
+
+    def similar_tracks(
+        self,
+        db: Session,
+        filename: str,
+        *,
+        threshold: float = NAME_SIMILARITY_THRESHOLD,
+        limit: int = NAME_SIMILARITY_LIMIT,
+    ) -> list[dict[str, object]]:
+        requested = self._normalized_name(filename, strip_extension=True)
+        if not requested:
+            return []
+        matches: list[tuple[float, int, dict[str, object]]] = []
+        for track in db.scalars(select(Track)).all():
+            names = {
+                self._normalized_name(track.original_filename, strip_extension=True),
+                self._normalized_name(track.title),
+                self._normalized_name(f"{track.artist} {track.title}"),
+                self._normalized_name(f"{track.title} {track.artist}"),
+            }
+            score = max(
+                (
+                    SequenceMatcher(None, requested, candidate).ratio()
+                    for candidate in names
+                    if candidate
+                ),
+                default=0.0,
+            )
+            if score < threshold:
+                continue
+            matches.append(
+                (
+                    score,
+                    track.id,
+                    {
+                        "id": track.id,
+                        "title": track.title,
+                        "artist": track.artist,
+                        "album": track.album,
+                        "original_filename": track.original_filename,
+                        "duration_seconds": track.duration_seconds,
+                        "similarity": round(score, 3),
+                    },
+                )
+            )
+        matches.sort(key=lambda item: (-item[0], item[1]))
+        return [candidate for _score, _track_id, candidate in matches[:limit]]
 
     @staticmethod
     def _sample_bits(audio: dict[str, object]) -> int:

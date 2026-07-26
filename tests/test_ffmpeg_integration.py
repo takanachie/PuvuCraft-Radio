@@ -65,7 +65,7 @@ def _reserve_and_upload(
     while time.monotonic() < deadline:
         snapshot = client.get("/api/admin/uploads")
         job = next(item for item in snapshot.json()["jobs"] if item["id"] == job_id)
-        if job["status"] in {"completed", "failed"}:
+        if job["status"] in {"completed", "failed", "rejected"}:
             break
         time.sleep(0.1)
     assert job is not None and job["status"] == "completed", job

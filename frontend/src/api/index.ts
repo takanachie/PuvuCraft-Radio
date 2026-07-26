@@ -114,13 +114,18 @@ export const api = {
     async uploadQueue(): Promise<UploadQueueSnapshot> {
       return request<UploadQueueSnapshot>('/api/admin/uploads')
     },
-    async reserveUpload(clientId: string, file: File): Promise<UploadJob> {
+    async reserveUpload(
+      clientId: string,
+      file: File,
+      confirmSimilar = false,
+    ): Promise<UploadJob> {
       const payload = await request<unknown>('/api/admin/uploads', {
         method: 'POST',
         json: {
           client_id: clientId,
           filename: file.name,
           size_bytes: file.size,
+          confirm_similar: confirmSimilar,
         },
       })
       return unwrapEntity<UploadJob>(payload, ['job'])

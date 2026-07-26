@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from '../../api'
-import { getCookie, userFacingError } from '../../api/client'
+import { getCookie, isApiError, userFacingError } from '../../api/client'
 import type {
   EntityId,
+  SimilarTrackCandidate,
   Track,
   TrackInput,
   UploadJob,
@@ -16,7 +17,13 @@ import StatusBadge from '../StatusBadge.vue'
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 const CLIENT_BOUND_UPLOADS = new Set<UploadJobStatus>(['queued', 'ready', 'uploading'])
-const TERMINAL_UPLOADS = new Set<UploadJobStatus>(['completed', 'failed', 'cancelled', 'expired'])
+const TERMINAL_UPLOADS = new Set<UploadJobStatus>([
+  'completed',
+  'failed',
+  'rejected',
+  'cancelled',
+  'expired',
+])
 const UPLOAD_LABELS: Record<UploadJobStatus, string> = {
   queued: '排队中',
   ready: '等待传输',
@@ -26,6 +33,7 @@ const UPLOAD_LABELS: Record<UploadJobStatus, string> = {
   placing: '迁移中',
   completed: '已完成',
   failed: '失败',
+  rejected: '已驳回',
   cancelled: '已取消',
   expired: '已过期',
 }
@@ -153,6 +161,26 @@ function xhrError(xhr: XMLHttpRequest): string {
   return xhr.status ? `上传请求失败 (${xhr.status})` : '上传连接已中断'
 }
 
+function similarTrackCandidates(cause: unknown): SimilarTrackCandidate[] {
+  if (!isApiError(cause) || cause.code !== 'similar_tracks_found') return []
+  if (!cause.body || typeof cause.body !== 'object') return []
+  const details = (cause.body as { details?: unknown }).details
+  if (!details || typeof details !== 'object') return []
+  const candidates = (details as { candidates?: unknown }).candidates
+  return Array.isArray(candidates) ? candidates as SimilarTrackCandidate[] : []
+}
+
+function confirmSimilarUpload(file: File, candidates: SimilarTrackCandidate[]): boolean {
+  const matches = candidates.map((candidate) => {
+    const artist = candidate.artist || '未知艺人'
+    const similarity = Math.round(candidate.similarity * 100)
+    return `• ${candidate.title} — ${artist}\n  ${candidate.original_filename} · 相似度 ${similarity}%`
+  }).join('\n')
+  return window.confirm(
+    `“${file.name}”与以下已有曲目名称相似：\n\n${matches}\n\n这可能是不同编码、现场版或重制版。确认仍要上传吗？`,
+  )
+}
+
 function startTransfer(job: UploadJob) {
   const file = filesByJob.get(job.id)
   if (!file || requestsByJob.has(job.id) || job.status !== 'ready' || !isOwnedJob(job)) return
@@ -208,9 +236,9 @@ function applyUploadSnapshot(snapshot: UploadQueueSnapshot) {
       if (job.status === 'completed') refreshLibrary = true
       if (isOwnedJob(job)) {
         if (job.status === 'completed') {
-          notice.value = job.duplicate
-            ? `${job.original_filename} 已完成；内容重复，沿用现有曲目。`
-            : `${job.original_filename} 已完成并写入 ${job.storage_id || '可用存储'}。`
+          notice.value = `${job.original_filename} 已完成并写入 ${job.storage_id || '可用存储'}。`
+        } else if (job.status === 'rejected') {
+          error.value = `${job.original_filename}：${job.error_message || 'SHA-256 与已有曲目相同，已自动驳回'}`
         } else if (job.status === 'failed') {
           error.value = `${job.original_filename}：${job.error_message || '服务器处理失败'}`
         }
@@ -263,18 +291,37 @@ async function reserveSelectedFiles() {
   clearMessages()
   reserving.value = true
   const accepted = new Set<File>()
+  const skipped = new Set<File>()
   try {
     for (const file of selectedFiles.value) {
-      const job = await api.admin.reserveUpload(uploadClientId, file)
+      let job: UploadJob
+      try {
+        job = await api.admin.reserveUpload(uploadClientId, file)
+      } catch (cause) {
+        const candidates = similarTrackCandidates(cause)
+        if (!candidates.length) throw cause
+        if (!confirmSimilarUpload(file, candidates)) {
+          skipped.add(file)
+          continue
+        }
+        job = await api.admin.reserveUpload(uploadClientId, file, true)
+      }
       filesByJob.set(job.id, file)
       accepted.add(file)
     }
-    notice.value = `已申请 ${accepted.size} 个上传任务；服务器将在并行位置空闲时自动开始传输。`
+    const summaries: string[] = []
+    if (accepted.size) {
+      summaries.push(`已申请 ${accepted.size} 个上传任务；服务器将在并行位置空闲时自动开始传输。`)
+    }
+    if (skipped.size) summaries.push(`已取消 ${skipped.size} 个疑似重复文件。`)
+    notice.value = summaries.join(' ')
   } catch (cause) {
     const prefix = accepted.size ? `已成功申请 ${accepted.size} 个任务；` : ''
     error.value = `${prefix}${userFacingError(cause, '无法申请上传队列位置')}`
   } finally {
-    selectedFiles.value = selectedFiles.value.filter((file) => !accepted.has(file))
+    selectedFiles.value = selectedFiles.value.filter(
+      (file) => !accepted.has(file) && !skipped.has(file),
+    )
     if (!selectedFiles.value.length && fileInput.value) fileInput.value.value = ''
     reserving.value = false
     void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
@@ -464,12 +511,12 @@ onBeforeUnmount(() => {
         >
           {{ reserving ? '正在申请…' : `申请上传队列 · ${uploadQueue.available_slots}/${uploadQueue.queue_limit} 空位` }}
         </button>
-        <small class="ingest-note">页面保持开启时服务器才会安排传输；关闭页面会取消排队及上传中的任务并清理临时文件。</small>
+        <small class="ingest-note">名称相似时需二次确认，SHA-256 完全相同会自动驳回。页面保持开启时服务器才会安排传输；关闭页面会取消排队及上传中的任务并清理临时文件。</small>
       </div>
       <div class="ingest-rack__scan">
         <span class="eyebrow">Server import</span>
         <strong>扫描受信任目录</strong>
-        <p>服务器会验证音频流、提取标签与封面、检测 SHA-256 重复；超出推流限制的文件将先规范化为 FLAC。</p>
+        <p>服务器会验证音频流、提取标签与封面、以 SHA-256 跳过精确重复；超出推流限制的文件将先规范化为 FLAC。</p>
         <button class="button button--quiet" type="button" :disabled="scanning" @click="scan">{{ scanning ? '扫描进行中…' : '开始目录扫描' }}</button>
       </div>
     </section>
@@ -514,7 +561,7 @@ onBeforeUnmount(() => {
                 </td>
                 <td data-label="存储">
                   <strong>{{ job.storage_id || '—' }}</strong>
-                  <small>{{ job.duplicate ? '重复内容复用' : job.status === 'completed' ? '已落盘' : '自动选择' }}</small>
+                  <small>{{ job.duplicate ? 'SHA-256 重复，已驳回' : job.status === 'completed' ? '已落盘' : '自动选择' }}</small>
                 </td>
                 <td data-label="操作" class="table-actions">
                   <button

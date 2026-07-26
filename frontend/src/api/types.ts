@@ -12,6 +12,7 @@ export type UploadJobStatus =
   | 'placing'
   | 'completed'
   | 'failed'
+  | 'rejected'
   | 'cancelled'
   | 'expired'
 
@@ -190,6 +191,16 @@ export interface UploadResponse {
   skipped?: number
   imported?: number
   message?: string
+}
+
+export interface SimilarTrackCandidate {
+  id: EntityId
+  title: string
+  artist: string
+  album: string
+  original_filename: string
+  duration_seconds: number
+  similarity: number
 }
 
 export interface UploadJob {

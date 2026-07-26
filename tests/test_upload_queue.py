@@ -4,8 +4,9 @@ import time
 from datetime import timedelta
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
-from backend.app.models import UploadJob, utcnow
+from backend.app.models import AuditEvent, Track, UploadJob, utcnow
 
 from .conftest import csrf_headers
 
@@ -128,3 +129,126 @@ def test_page_close_expires_all_client_jobs(initialized_admin: TestClient) -> No
     assert len(jobs) == 2
     assert all(job["status"] == "expired" for job in jobs)
     assert all(job["error_code"] == "page_closed" for job in jobs)
+
+
+def test_similar_name_requires_confirmation_before_reservation(
+    initialized_admin: TestClient,
+) -> None:
+    client = initialized_admin
+    with client.app.state.database.session_factory.begin() as db:
+        db.add(
+            Track(
+                storage_id="primary",
+                storage_name="existing-track.flac",
+                original_filename="01 - Example Artist - Example Song.flac",
+                sha256="a" * 64,
+                file_size_bytes=4096,
+                mime_type="audio/flac",
+                audio_stream_index=0,
+                duration_seconds=180,
+                sample_rate=48000,
+                channels=2,
+                bits_per_sample=24,
+                normalized=False,
+                title="Example Song",
+                artist="Example Artist",
+                album="Example Album",
+                available=True,
+            )
+        )
+
+    response = client.post(
+        "/api/admin/uploads",
+        headers=csrf_headers(client),
+        json={
+            "client_id": CLIENT_ID,
+            "filename": "Example Artist - Example Song.mp3",
+            "size_bytes": 2048,
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "similar_tracks_found"
+    assert response.json()["details"]["candidates"][0]["title"] == "Example Song"
+    assert client.get("/api/admin/uploads").json()["jobs"] == []
+
+    confirmed = client.post(
+        "/api/admin/uploads",
+        headers=csrf_headers(client),
+        json={
+            "client_id": CLIENT_ID,
+            "filename": "Example Artist - Example Song.mp3",
+            "size_bytes": 2048,
+            "confirm_similar": True,
+        },
+    )
+    assert confirmed.status_code == 201
+
+
+def test_sha_duplicate_result_is_automatically_rejected(
+    initialized_admin: TestClient,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    client = initialized_admin
+    owner_id = int(client.get("/api/auth/me").json()["user"]["id"])
+    now = utcnow()
+    with client.app.state.database.session_factory.begin() as db:
+        track = Track(
+            storage_id="primary",
+            storage_name="existing.flac",
+            original_filename="existing.flac",
+            sha256="b" * 64,
+            file_size_bytes=4096,
+            mime_type="audio/flac",
+            audio_stream_index=0,
+            duration_seconds=180,
+            sample_rate=48000,
+            channels=2,
+            bits_per_sample=24,
+            normalized=False,
+            title="Existing Song",
+            artist="Example Artist",
+            album="",
+            available=True,
+        )
+        db.add(track)
+        db.flush()
+        track_id = track.id
+        db.add(
+            UploadJob(
+                id="f" * 32,
+                owner_user_id=owner_id,
+                client_id=CLIENT_ID,
+                original_filename="duplicate.flac",
+                declared_size_bytes=4096,
+                bytes_received=4096,
+                status="verifying",
+                temp_name="duplicate.part.flac",
+                client_seen_at=now,
+                started_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    def duplicate_result(*_args, **_kwargs):
+        with client.app.state.database.session_factory() as db:
+            return db.get(Track, track_id), True
+
+    monkeypatch.setattr(client.app.state.media, "import_staged", duplicate_result)
+    client.app.state.uploads._process_sync("f" * 32, tmp_path / "unused.flac")
+
+    with client.app.state.database.session_factory() as db:
+        job = db.get(UploadJob, "f" * 32)
+        assert job is not None
+        assert job.status == "rejected"
+        assert job.duplicate is True
+        assert job.track_id == track_id
+        assert job.error_code == "duplicate_content"
+        event = db.scalar(
+            select(AuditEvent)
+            .where(AuditEvent.action == "track.upload_rejected")
+            .order_by(AuditEvent.id.desc())
+        )
+        assert event is not None
+        assert event.details["reason"] == "sha256_match"

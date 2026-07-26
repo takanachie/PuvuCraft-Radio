@@ -30,7 +30,7 @@ CAPACITY_STATUSES = {"queued", "ready", "uploading", "verifying", "normalizing",
 ACTIVE_STATUSES = {"ready", "uploading", "verifying", "normalizing", "placing"}
 CLIENT_BOUND_STATUSES = {"queued", "ready", "uploading"}
 PROCESSING_STATUSES = {"verifying", "normalizing", "placing"}
-TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired"}
+TERMINAL_STATUSES = {"completed", "failed", "rejected", "cancelled", "expired"}
 
 
 class UploadEventBroker:
@@ -228,6 +228,8 @@ class UploadManager:
         client_id: str,
         filename: str,
         size_bytes: int,
+        *,
+        confirm_similar: bool = False,
     ) -> dict[str, object]:
         filename = Path(filename).name
         if not filename:
@@ -235,6 +237,16 @@ class UploadManager:
         self.media.validate_filename(filename)
         if size_bytes > self.settings.media.max_upload_bytes:
             raise ApiError(413, "file_too_large", "音频文件超过 500 MiB 上限")
+        if not confirm_similar:
+            with self.database.session_factory() as db:
+                candidates = self.media.similar_tracks(db, filename)
+            if candidates:
+                raise ApiError(
+                    409,
+                    "similar_tracks_found",
+                    "检测到名称相似的已有曲目，请确认后继续上传",
+                    {"candidates": candidates},
+                )
         now = utcnow()
         with self._reservation_lock, self.database.session_factory.begin() as db:
             occupied = (
@@ -500,7 +512,7 @@ class UploadManager:
             job = db.get(UploadJob, job_id)
             if job is None:
                 return
-            job.status = "completed"
+            job.status = "rejected" if duplicate else "completed"
             job.bytes_received = job.declared_size_bytes
             job.temp_name = None
             job.storage_id = track.storage_id
@@ -508,17 +520,25 @@ class UploadManager:
             job.sha256 = track.sha256
             job.track_id = track.id
             job.duplicate = duplicate
-            job.error_code = None
-            job.error_message = None
+            job.error_code = "duplicate_content" if duplicate else None
+            job.error_message = (
+                f"内容与已有曲目“{track.title}”完全相同，已自动驳回"
+                if duplicate
+                else None
+            )
             job.completed_at = now
             job.updated_at = now
             db.add(
                 AuditEvent(
                     actor_user_id=owner_id,
-                    action="track.uploaded",
+                    action="track.upload_rejected" if duplicate else "track.uploaded",
                     target_type="track",
                     target_id=str(track.id),
-                    details={"duplicate": duplicate, "upload_job_id": job_id},
+                    details={
+                        "duplicate": duplicate,
+                        "upload_job_id": job_id,
+                        **({"reason": "sha256_match"} if duplicate else {}),
+                    },
                 )
             )
 

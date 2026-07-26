@@ -106,6 +106,7 @@ class UploadReservationInput(ApiModel):
     client_id: str
     filename: str = Field(min_length=1, max_length=512)
     size_bytes: int = Field(gt=0)
+    confirm_similar: bool = False
 
     @field_validator("client_id")
     @classmethod

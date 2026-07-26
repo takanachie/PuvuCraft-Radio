@@ -42,6 +42,7 @@ def reserve_upload(
             payload.client_id,
             payload.filename,
             payload.size_bytes,
+            confirm_similar=payload.confirm_similar,
         )
     }
 
