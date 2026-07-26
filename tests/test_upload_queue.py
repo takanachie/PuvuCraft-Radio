@@ -11,6 +11,7 @@ from backend.app import database as database_module
 from backend.app.dependencies import get_db
 from backend.app.main import create_app
 from backend.app.models import AuditEvent, MusicLibrary, Track, UploadJob, utcnow
+from backend.app.routers import uploads as upload_routes
 
 from .conftest import csrf_headers
 
@@ -60,10 +61,10 @@ def _wait_for_job_status(
     raise AssertionError(f"upload job did not reach {statuses}: {job}")
 
 
-def test_upload_routes_do_not_hold_request_scoped_database_sessions(app) -> None:
+def test_upload_routes_do_not_hold_request_scoped_database_sessions() -> None:
     routes = [
         route
-        for route in app.routes
+        for route in upload_routes.router.routes
         if isinstance(route, APIRoute) and route.path.startswith("/api/admin/uploads")
     ]
     assert routes
