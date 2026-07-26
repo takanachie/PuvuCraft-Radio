@@ -48,12 +48,12 @@ def test_public_queue_enforces_capacity_and_parallel_limit(
 ) -> None:
     client = initialized_admin
     created = []
-    for index in range(10):
+    for index in range(20):
         response = _reserve(client, index)
         assert response.status_code == 201, response.text
         created.append(response.json()["job"])
 
-    full = _reserve(client, 10)
+    full = _reserve(client, 20)
     assert full.status_code == 409
     assert full.json()["code"] == "upload_queue_full"
 
@@ -63,16 +63,16 @@ def test_public_queue_enforces_capacity_and_parallel_limit(
         response = client.get("/api/admin/uploads")
         assert response.status_code == 200
         snapshot = response.json()
-        if snapshot["active_count"] == 3:
+        if snapshot["active_count"] == 5:
             break
         time.sleep(0.05)
     assert snapshot is not None
     created_ids = {job["id"] for job in created}
     statuses = [job["status"] for job in snapshot["jobs"] if job["id"] in created_ids]
-    assert statuses.count("ready") == 3
-    assert statuses.count("queued") == 7
-    assert snapshot["queue_limit"] == 10
-    assert snapshot["max_concurrent"] == 3
+    assert statuses.count("ready") == 5
+    assert statuses.count("queued") == 15
+    assert snapshot["queue_limit"] == 20
+    assert snapshot["max_concurrent"] == 5
     assert snapshot["available_slots"] == 0
 
     cancelled = next(job for job in snapshot["jobs"] if job["status"] == "ready")
@@ -81,7 +81,7 @@ def test_public_queue_enforces_capacity_and_parallel_limit(
         headers=csrf_headers(client),
     )
     assert response.status_code == 204
-    replacement = _reserve(client, 11)
+    replacement = _reserve(client, 21)
     assert replacement.status_code == 201, replacement.text
 
 

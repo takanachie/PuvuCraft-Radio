@@ -40,9 +40,9 @@ def test_seed_channel_slug_cannot_escape_hls_root(settings: Settings) -> None:
         Settings.model_validate(payload)
 
 
-def test_upload_queue_limit_is_fixed_at_ten(settings: Settings) -> None:
+def test_upload_queue_limit_is_fixed_at_twenty(settings: Settings) -> None:
     payload = settings.model_dump()
-    payload["uploads"]["queue_limit"] = 11
+    payload["uploads"]["queue_limit"] = 21
     with pytest.raises(ValidationError):
         Settings.model_validate(payload)
 

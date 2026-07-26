@@ -78,8 +78,8 @@ media:
 
 uploads:
   temp_dir: "/opt/radio/tmp"
-  queue_limit: 10
-  max_concurrent: 3
+  queue_limit: 20
+  max_concurrent: 5
   ready_lease_seconds: 120
   heartbeat_interval_seconds: 5
   heartbeat_timeout_seconds: 15

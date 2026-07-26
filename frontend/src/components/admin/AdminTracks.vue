@@ -16,7 +16,7 @@ import InlineNotice from '../InlineNotice.vue'
 import StatusBadge from '../StatusBadge.vue'
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
-const MAX_PENDING_FILES = 1000
+const MAX_LOCAL_UPLOADS = 1000
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.flac', '.m4a', '.aac', '.wav', '.ogg'])
 const CLIENT_BOUND_UPLOADS = new Set<UploadJobStatus>(['queued', 'ready', 'uploading'])
 const VISIBLE_UPLOADS = new Set<UploadJobStatus>([
@@ -48,6 +48,12 @@ const UPLOAD_LABELS: Record<UploadJobStatus, string> = {
   expired: '已过期',
 }
 
+interface SubmittedUploadTask {
+  id: string
+  file: File
+  similarities: SimilarTrackCandidate[]
+}
+
 function createUploadClientId(): string {
   const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
@@ -56,19 +62,22 @@ function createUploadClientId(): string {
 const uploadClientId = createUploadClientId()
 const tracks = ref<Track[]>([])
 const loading = ref(true)
-const reserving = ref(false)
+const committing = ref(false)
 const preflighting = ref(false)
+const feedingSubmitted = ref(false)
 const saving = ref(false)
 const error = ref('')
 const notice = ref('')
 const search = ref('')
 const selectedFiles = ref<File[]>([])
+const submittedUploads = ref<SubmittedUploadTask[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
 const directoryInput = ref<HTMLInputElement | null>(null)
 const uploadReviewOpen = ref(false)
 const uploadReviewQuery = ref('')
 const uploadReviewError = ref('')
 const uploadReviewNotice = ref('')
+const submittedQueueError = ref('')
 const uploadReviewSearchInput = ref<HTMLInputElement | null>(null)
 const similaritiesByFile = ref<Record<string, SimilarTrackCandidate[]>>({})
 const confirmedSimilarFiles = ref<Set<string>>(new Set())
@@ -77,8 +86,8 @@ const coverFile = ref<File | null>(null)
 const editForm = reactive<TrackInput>({ title: '', artist: '', album: '', cover_url: '' })
 const uploadQueue = ref<UploadQueueSnapshot>({
   jobs: [],
-  queue_limit: 10,
-  max_concurrent: 3,
+  queue_limit: 20,
+  max_concurrent: 5,
   active_count: 0,
   available_slots: 0,
   heartbeat_interval_seconds: 5,
@@ -97,6 +106,8 @@ let visibleTrackRequest = 0
 let libraryRefreshPending = false
 let libraryRefreshRunning = false
 let preflightRequest = 0
+let submittedRetryTimer: number | undefined
+let submittedRetryAttempt = 0
 let leaving = false
 
 const editingTrack = computed(() => tracks.value.find((track) => String(track.id) === String(editingId.value)) || null)
@@ -114,6 +125,9 @@ const visibleUploadJobs = computed(() =>
 )
 const pendingUploadBytes = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
+)
+const submittedUploadBytes = computed(() =>
+  submittedUploads.value.reduce((total, task) => total + task.file.size, 0),
 )
 const invalidPendingCount = computed(() =>
   selectedFiles.value.filter((file) => Boolean(pendingFileIssue(file))).length,
@@ -143,9 +157,6 @@ const unconfirmedSimilarCount = computed(() =>
     const key = pendingFileKey(file)
     return pendingFileSimilarities(file).length > 0 && !confirmedSimilarFiles.value.has(key)
   }).length,
-)
-const reservableFileCount = computed(() =>
-  queueLoading.value ? 0 : Math.min(selectedFiles.value.length, uploadQueue.value.available_slots),
 )
 
 function clearMessages() {
@@ -240,7 +251,11 @@ function stageFiles(files: File[], source: 'files' | 'directory') {
   if (!files.length) return
   clearMessages()
   uploadReviewError.value = ''
-  const existingKeys = new Set(selectedFiles.value.map(pendingFileKey))
+  const existingKeys = new Set([
+    ...selectedFiles.value.map(pendingFileKey),
+    ...submittedUploads.value.map((task) => pendingFileKey(task.file)),
+    ...[...filesByJob.values()].map(pendingFileKey),
+  ])
   const additions: File[] = []
   let duplicateCount = 0
   let unsupportedCount = 0
@@ -256,7 +271,12 @@ function stageFiles(files: File[], source: 'files' | 'directory') {
       duplicateCount += 1
       continue
     }
-    if (selectedFiles.value.length + additions.length >= MAX_PENDING_FILES) {
+    if (
+      selectedFiles.value.length
+      + submittedUploads.value.length
+      + additions.length
+      >= MAX_LOCAL_UPLOADS
+    ) {
       overflowCount += 1
       continue
     }
@@ -275,7 +295,9 @@ function stageFiles(files: File[], source: 'files' | 'directory') {
   }
   if (unsupportedCount) messages.push(`已忽略 ${unsupportedCount} 个不支持的文件。`)
   if (duplicateCount) messages.push(`已忽略 ${duplicateCount} 个重复选择。`)
-  if (overflowCount) messages.push(`待上传清单最多保留 ${MAX_PENDING_FILES} 个文件。`)
+  if (overflowCount) {
+    messages.push(`本地待确认与已提交队列合计最多保留 ${MAX_LOCAL_UPLOADS} 个文件。`)
+  }
   uploadReviewNotice.value = messages.join(' ')
 
   if (selectedFiles.value.length) {
@@ -289,7 +311,7 @@ function stageFiles(files: File[], source: 'files' | 'directory') {
 
 function chooseFiles(event: Event) {
   const input = event.target as HTMLInputElement
-  if (reserving.value) {
+  if (committing.value) {
     input.value = ''
     return
   }
@@ -299,7 +321,7 @@ function chooseFiles(event: Event) {
 
 function chooseDirectory(event: Event) {
   const input = event.target as HTMLInputElement
-  if (reserving.value) {
+  if (committing.value) {
     input.value = ''
     return
   }
@@ -316,11 +338,11 @@ function openUploadReview() {
 }
 
 function closeUploadReview() {
-  if (!reserving.value) uploadReviewOpen.value = false
+  if (!committing.value) uploadReviewOpen.value = false
 }
 
 function clearPendingFiles() {
-  if (reserving.value) return
+  if (committing.value) return
   preflightRequest += 1
   preflighting.value = false
   selectedFiles.value = []
@@ -335,7 +357,7 @@ function clearPendingFiles() {
 }
 
 function removePendingFile(file: File) {
-  if (reserving.value) return
+  if (committing.value) return
   const key = pendingFileKey(file)
   selectedFiles.value = selectedFiles.value.filter((candidate) => candidate !== file)
   const nextSimilarities = { ...similaritiesByFile.value }
@@ -382,6 +404,16 @@ async function preflightPendingFiles(): Promise<boolean> {
     const filenames = [...new Set(files.map((file) => file.name))]
     const result = await api.admin.preflightUploads(filenames)
     if (requestId !== preflightRequest) return false
+    if (
+      files.length !== selectedFiles.value.length
+      || files.some(
+        (file, index) =>
+          pendingFileKey(file) !== pendingFileKey(selectedFiles.value[index]),
+      )
+    ) {
+      uploadReviewError.value = '待上传清单在检查期间发生变化，请重新确认后提交。'
+      return false
+    }
     const byFilename = new Map(
       result.files.map((checked) => [checked.filename, checked.candidates] as const),
     )
@@ -532,6 +564,7 @@ function applyUploadSnapshot(snapshot: UploadQueueSnapshot) {
     }
   }
   if (refreshLibrary) scheduleLibraryRefresh()
+  scheduleSubmittedUploads()
 }
 
 async function refreshUploadQueue() {
@@ -570,78 +603,215 @@ function startHeartbeat(seconds: number) {
   }, nextSeconds * 1000)
 }
 
-async function reserveSelectedFiles() {
-  if (!selectedFiles.value.length || reserving.value || preflighting.value) return
-  uploadReviewError.value = ''
-  const preflightComplete = await preflightPendingFiles()
-  if (!preflightComplete) return
-  if (invalidPendingCount.value) {
-    uploadReviewError.value = '请先移除空文件或超过 500 MiB 上限的文件。'
-    return
-  }
-  if (unconfirmedSimilarCount.value) {
-    uploadReviewError.value = `仍有 ${unconfirmedSimilarCount.value} 个相似文件未完成二次确认。`
-    return
-  }
-  if (queueLoading.value || uploadQueue.value.available_slots <= 0) {
-    uploadReviewError.value = '公共上传队列当前没有空位，请稍后重试。'
-    return
-  }
+function clearSubmittedRetry() {
+  if (submittedRetryTimer !== undefined) window.clearTimeout(submittedRetryTimer)
+  submittedRetryTimer = undefined
+}
 
-  const filesToReserve = selectedFiles.value.slice(0, uploadQueue.value.available_slots)
-  clearMessages()
-  reserving.value = true
-  const accepted = new Set<File>()
-  let similarityChanged = false
+function scheduleSubmittedRetry() {
+  if (leaving || submittedRetryTimer !== undefined || !submittedUploads.value.length) return
+  const delay = Math.min(30_000, 1500 * 2 ** submittedRetryAttempt)
+  submittedRetryAttempt += 1
+  submittedRetryTimer = window.setTimeout(() => {
+    submittedRetryTimer = undefined
+    void retrySubmittedUploads()
+  }, delay)
+}
+
+function scheduleSubmittedUploads() {
+  if (
+    leaving
+    || feedingSubmitted.value
+    || submittedRetryTimer !== undefined
+    || queueLoading.value
+    || uploadQueue.value.available_slots <= 0
+    || !submittedUploads.value.length
+  ) return
+  void pushSubmittedUploads()
+}
+
+function returnSubmittedTaskForReview(
+  task: SubmittedUploadTask,
+  candidates: SimilarTrackCandidate[],
+) {
+  submittedUploads.value = submittedUploads.value.filter((item) => item.id !== task.id)
+  if (
+    !selectedFiles.value.some(
+      (file) => pendingFileKey(file) === pendingFileKey(task.file),
+    )
+  ) {
+    selectedFiles.value = [...selectedFiles.value, task.file]
+  }
+  updateFileSimilarities(task.file, candidates)
+  uploadReviewNotice.value = ''
+  uploadReviewError.value = `“${task.file.name}”的相似度结果在等待期间发生变化，请重新确认。`
+  uploadReviewOpen.value = true
+  void nextTick(() => uploadReviewSearchInput.value?.focus())
+}
+
+async function pushSubmittedUploads() {
+  if (
+    feedingSubmitted.value
+    || leaving
+    || queueLoading.value
+    || uploadQueue.value.available_slots <= 0
+    || !submittedUploads.value.length
+  ) return
+
+  feedingSubmitted.value = true
+  clearSubmittedRetry()
+  let availableSlots = uploadQueue.value.available_slots
+  let pushed = 0
+  let shouldContinue = false
+  let pushFailed = false
   try {
-    for (const file of filesToReserve) {
+    const batch = submittedUploads.value.slice(0, availableSlots)
+    const checked = await api.admin.preflightUploads([
+      ...new Set(batch.map((task) => task.file.name)),
+    ])
+    if (leaving) return
+    const latestByFilename = new Map(
+      checked.files.map((file) => [file.filename, file.candidates] as const),
+    )
+
+    for (const task of batch) {
+      if (leaving || availableSlots <= 0) break
+      if (!submittedUploads.value.some((item) => item.id === task.id)) continue
+      const latestCandidates = latestByFilename.get(task.file.name) || []
+      if (
+        candidateSignature(latestCandidates)
+        !== candidateSignature(task.similarities)
+      ) {
+        returnSubmittedTaskForReview(task, latestCandidates)
+        shouldContinue = true
+        continue
+      }
+
       let job: UploadJob
       try {
         job = await api.admin.reserveUpload(
           uploadClientId,
-          file,
-          confirmedSimilarFiles.value.has(pendingFileKey(file)),
+          task.file,
+          latestCandidates.length > 0,
         )
       } catch (cause) {
         const candidates = similarTrackCandidates(cause)
-        if (!candidates.length) throw cause
-        updateFileSimilarities(file, candidates)
-        uploadReviewError.value = `“${file.name}”的相似度检查结果已变化，请重新确认后继续。`
-        similarityChanged = true
+        if (candidates.length) {
+          returnSubmittedTaskForReview(task, candidates)
+          shouldContinue = true
+          continue
+        }
+        if (isApiError(cause) && cause.code === 'upload_queue_full') {
+          uploadQueue.value = { ...uploadQueue.value, available_slots: 0 }
+          break
+        }
+        throw cause
+      }
+
+      if (leaving) {
+        void api.admin.cancelUpload(job.id).catch(() => undefined)
         break
       }
-      filesByJob.set(job.id, file)
-      accepted.add(file)
-    }
-    if (accepted.size) {
-      notice.value = `已申请 ${accepted.size} 个上传任务；服务器将在并行位置空闲时自动开始传输。`
-    }
-    const remaining = selectedFiles.value.length - accepted.size
-    if (remaining && !similarityChanged) {
-      uploadReviewNotice.value = `本次已提交 ${accepted.size} 个文件，仍有 ${remaining} 个文件保留在待上传清单中。`
+      filesByJob.set(job.id, task.file)
+      submittedUploads.value = submittedUploads.value.filter(
+        (item) => item.id !== task.id,
+      )
+      availableSlots -= 1
+      pushed += 1
     }
   } catch (cause) {
-    const prefix = accepted.size ? `已成功申请 ${accepted.size} 个任务；` : ''
-    uploadReviewError.value = `${prefix}${userFacingError(cause, '无法申请上传队列位置')}`
-  } finally {
-    const acceptedKeys = new Set([...accepted].map(pendingFileKey))
-    selectedFiles.value = selectedFiles.value.filter((file) => !accepted.has(file))
-    similaritiesByFile.value = Object.fromEntries(
-      Object.entries(similaritiesByFile.value)
-        .filter(([key]) => !acceptedKeys.has(key)),
-    )
-    confirmedSimilarFiles.value = new Set(
-      [...confirmedSimilarFiles.value].filter((key) => !acceptedKeys.has(key)),
-    )
-    if (!selectedFiles.value.length) {
-      uploadReviewOpen.value = false
-      uploadReviewQuery.value = ''
-      uploadReviewError.value = ''
-      uploadReviewNotice.value = ''
+    if (!leaving) {
+      pushFailed = true
+      submittedQueueError.value = userFacingError(
+        cause,
+        '本地已提交任务暂时无法推送至公共队列',
+      )
+      scheduleSubmittedRetry()
     }
-    reserving.value = false
+  } finally {
+    feedingSubmitted.value = false
+  }
+
+  if (leaving) return
+  if (pushed) {
+    if (!pushFailed) {
+      submittedRetryAttempt = 0
+      submittedQueueError.value = ''
+    }
+    notice.value = `已将 ${pushed} 个本地任务推送至公共上传队列。`
     void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
     await refreshUploadQueue()
+  } else if (shouldContinue && !pushFailed) {
+    scheduleSubmittedUploads()
+  }
+  if (!submittedUploads.value.length) {
+    clearSubmittedRetry()
+    submittedRetryAttempt = 0
+    submittedQueueError.value = ''
+  }
+}
+
+async function retrySubmittedUploads() {
+  if (leaving || feedingSubmitted.value || !submittedUploads.value.length) return
+  clearSubmittedRetry()
+  submittedQueueError.value = ''
+  await refreshUploadQueue()
+  scheduleSubmittedUploads()
+}
+
+function removeSubmittedUpload(task: SubmittedUploadTask) {
+  if (feedingSubmitted.value) return
+  submittedUploads.value = submittedUploads.value.filter((item) => item.id !== task.id)
+  if (!submittedUploads.value.length) {
+    clearSubmittedRetry()
+    submittedRetryAttempt = 0
+    submittedQueueError.value = ''
+  } else {
+    scheduleSubmittedUploads()
+  }
+}
+
+async function commitSelectedFiles() {
+  if (!selectedFiles.value.length || committing.value || preflighting.value) return
+  committing.value = true
+  uploadReviewError.value = ''
+  let committedCount = 0
+  try {
+    const preflightComplete = await preflightPendingFiles()
+    if (!preflightComplete) return
+    if (invalidPendingCount.value) {
+      uploadReviewError.value = '请先移除空文件或超过 500 MiB 上限的文件。'
+      return
+    }
+    if (unconfirmedSimilarCount.value) {
+      uploadReviewError.value = `仍有 ${unconfirmedSimilarCount.value} 个相似文件未完成二次确认。`
+      return
+    }
+
+    clearMessages()
+    const files = [...selectedFiles.value]
+    const tasks = files.map((file) => ({
+      id: createUploadClientId(),
+      file,
+      similarities: [...pendingFileSimilarities(file)],
+    }))
+    submittedUploads.value = [...submittedUploads.value, ...tasks]
+    committedCount = tasks.length
+    selectedFiles.value = []
+    similaritiesByFile.value = {}
+    confirmedSimilarFiles.value = new Set()
+    uploadReviewOpen.value = false
+    uploadReviewQuery.value = ''
+    uploadReviewError.value = ''
+    uploadReviewNotice.value = ''
+    if (fileInput.value) fileInput.value.value = ''
+    if (directoryInput.value) directoryInput.value.value = ''
+  } finally {
+    committing.value = false
+  }
+  if (committedCount) {
+    notice.value = `已将 ${committedCount} 个文件提交到本地已提交队列；公共队列出现空位后会自动推送。`
+    scheduleSubmittedUploads()
   }
 }
 
@@ -770,6 +940,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', expireOwnedUploads)
   eventSource?.close()
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
+  clearSubmittedRetry()
 })
 </script>
 
@@ -779,7 +950,7 @@ onBeforeUnmount(() => {
       <div>
         <span class="eyebrow">Media ingest</span>
         <h2>音乐库</h2>
-        <p>从本地选择音频文件或整个目录，确认待上传清单后进入公共队列。</p>
+        <p>从本地选择音频文件或整个目录，确认后先进入本地已提交队列，再按空位推送至公共队列。</p>
       </div>
       <div class="metric-pair">
         <div><strong>{{ availableCount }}</strong><span>AVAILABLE</span></div>
@@ -805,7 +976,7 @@ onBeforeUnmount(() => {
           type="file"
           multiple
           accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*"
-          :disabled="reserving"
+          :disabled="committing"
           @change="chooseFiles"
         />
         <div v-if="selectedFiles.length" class="pending-upload-summary">
@@ -816,12 +987,12 @@ onBeforeUnmount(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="reserving || !selectedFiles.length"
+          :disabled="committing || !selectedFiles.length"
           @click="openUploadReview"
         >
           管理并确认待上传清单
         </button>
-        <small class="ingest-note">名称相似时需二次确认，SHA-256 完全相同会自动驳回。页面保持开启时服务器才会安排传输；关闭页面会取消排队及上传中的任务并清理临时文件。</small>
+        <small class="ingest-note">名称相似时需二次确认，SHA-256 完全相同会自动驳回。确认后的全部文件会在本地等待，并持续按公共队列空位自动推送；关闭页面会清空本地等待任务、取消远端任务并清理临时文件。</small>
       </div>
       <div class="ingest-rack__scan">
         <span class="eyebrow">Local directory</span>
@@ -829,7 +1000,7 @@ onBeforeUnmount(() => {
         <p>由操作者选择本机目录；浏览器会递归读取其中支持的音频文件，并先加入可编辑的待上传清单，不会立即占用公共队列。</p>
         <label
           class="button button--quiet upload-picker-button"
-          :class="{ disabled: reserving }"
+          :class="{ disabled: committing }"
           for="track-directory"
         >
           选择本地目录
@@ -842,7 +1013,7 @@ onBeforeUnmount(() => {
           multiple
           webkitdirectory
           accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*"
-          :disabled="reserving"
+          :disabled="committing"
           @change="chooseDirectory"
         />
       </div>
@@ -874,7 +1045,7 @@ onBeforeUnmount(() => {
               class="icon-close"
               type="button"
               aria-label="关闭待上传清单"
-              :disabled="reserving"
+              :disabled="committing"
               @click="closeUploadReview"
             >
               ×
@@ -910,19 +1081,19 @@ onBeforeUnmount(() => {
               </span>
               <label
                 class="button button--quiet button--small upload-picker-button"
-                :class="{ disabled: reserving }"
+                :class="{ disabled: committing }"
                 for="track-files"
               >
                 添加文件
               </label>
               <label
                 class="button button--quiet button--small upload-picker-button"
-                :class="{ disabled: reserving }"
+                :class="{ disabled: committing }"
                 for="track-directory"
               >
                 添加目录
               </label>
-              <button class="text-button" type="button" :disabled="reserving" @click="clearPendingFiles">清空</button>
+              <button class="text-button" type="button" :disabled="committing" @click="clearPendingFiles">清空</button>
             </div>
           </div>
 
@@ -955,7 +1126,7 @@ onBeforeUnmount(() => {
               <button
                 class="button button--danger button--small"
                 type="button"
-                :disabled="reserving"
+                :disabled="committing"
                 :aria-label="`从待上传清单移除 ${file.name}`"
                 @click="removePendingFile(file)"
               >
@@ -988,7 +1159,7 @@ onBeforeUnmount(() => {
                   <input
                     type="checkbox"
                     :checked="confirmedSimilarFiles.has(pendingFileKey(file))"
-                    :disabled="reserving || preflighting"
+                    :disabled="committing || preflighting"
                     @change="changeSimilarityConfirmation(file, $event)"
                   />
                   <span>我已核对相似记录，仍确认上传此文件；SHA-256 完全重复仍会自动驳回</span>
@@ -1001,37 +1172,31 @@ onBeforeUnmount(() => {
           </div>
 
           <footer class="batch-add-tab__footer">
-            <span v-if="queueLoading">正在读取公共上传队列容量…</span>
-            <span v-else-if="!uploadQueue.available_slots">公共上传队列已满，清单会保留在本页面中。</span>
-            <span v-else-if="selectedFiles.length > reservableFileCount">
-              当前有 {{ uploadQueue.available_slots }} 个空位，本次将提交清单前 {{ reservableFileCount }} 个文件，其余继续保留。
-            </span>
-            <span v-else>
-              当前可申请 {{ uploadQueue.available_slots }}/{{ uploadQueue.queue_limit }} 个公共队列位置。
+            <span>
+              确认后，全部 {{ selectedFiles.length }} 个文件都会进入本地已提交队列；即使公共队列已满，也会继续等待并在空位出现时自动推送。
             </span>
             <div>
-              <button class="button button--quiet" type="button" :disabled="reserving" @click="closeUploadReview">
+              <button class="button button--quiet" type="button" :disabled="committing" @click="closeUploadReview">
                 稍后处理
               </button>
               <button
                 class="button button--primary"
                 type="button"
                 :disabled="
-                  reserving
+                  committing
                   || preflighting
-                  || queueLoading
-                  || !reservableFileCount
+                  || !selectedFiles.length
                   || invalidPendingCount > 0
                   || unconfirmedSimilarCount > 0
                 "
-                @click="reserveSelectedFiles"
+                @click="commitSelectedFiles"
               >
                 {{
-                  reserving
-                    ? '正在申请…'
+                  committing
+                    ? '正在提交…'
                     : preflighting
                       ? '正在检查相似度…'
-                      : `确认并申请 ${reservableFileCount} 个队列位置`
+                      : `确认提交 ${selectedFiles.length} 个本地任务`
                 }}
               </button>
             </div>
@@ -1039,6 +1204,68 @@ onBeforeUnmount(() => {
         </section>
       </div>
     </Teleport>
+
+    <section class="upload-queue-panel local-upload-queue" aria-labelledby="local-upload-queue-title">
+      <header class="upload-queue-panel__header">
+        <div>
+          <span class="eyebrow">Local submitted queue</span>
+          <h3 id="local-upload-queue-title">本地已提交队列</h3>
+          <p>保存所有已确认但尚未取得公共队列位置的文件；只要本页面保持开启，就会持续按远端空位自动推送。</p>
+        </div>
+        <div class="queue-metrics">
+          <span><strong>{{ submittedUploads.length }}</strong>等待推送</span>
+          <span><strong>{{ formatFileSize(submittedUploadBytes) }}</strong>本地文件</span>
+          <span><strong>{{ uploadQueue.available_slots }}</strong>远端空位</span>
+        </div>
+      </header>
+      <InlineNotice v-if="submittedQueueError" tone="danger">
+        {{ submittedQueueError }}
+        <button
+          class="text-button"
+          type="button"
+          :disabled="feedingSubmitted"
+          @click="retrySubmittedUploads"
+        >
+          立即重试
+        </button>
+      </InlineNotice>
+      <div class="data-frame local-upload-queue__frame">
+        <table class="console-table local-upload-queue-table">
+          <thead><tr><th>顺序</th><th>文件</th><th>大小</th><th>本地阶段</th><th class="align-right">操作</th></tr></thead>
+          <tbody>
+            <tr v-if="!submittedUploads.length">
+              <td colspan="5" class="table-message">没有等待推送至公共队列的本地任务。</td>
+            </tr>
+            <template v-else>
+              <tr v-for="(task, index) in submittedUploads" :key="task.id">
+                <td data-label="顺序"><span class="playlist-position">{{ String(index + 1).padStart(3, '0') }}</span></td>
+                <td data-label="文件">
+                  <strong>{{ task.file.name }}</strong>
+                  <small v-if="pendingFilePath(task.file) !== task.file.name">{{ pendingFilePath(task.file) }}</small>
+                </td>
+                <td data-label="大小">{{ formatFileSize(task.file.size) }}</td>
+                <td data-label="本地阶段">
+                  <StatusBadge
+                    :status="feedingSubmitted && index === 0 ? 'ready' : 'queued'"
+                    :label="feedingSubmitted && index === 0 ? '正在申请公共队列位置' : '等待公共队列空位'"
+                  />
+                </td>
+                <td data-label="操作" class="table-actions">
+                  <button
+                    class="button button--danger button--small"
+                    type="button"
+                    :disabled="feedingSubmitted"
+                    @click="removeSubmittedUpload(task)"
+                  >
+                    移除
+                  </button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
     <section class="upload-queue-panel" aria-labelledby="upload-queue-title">
       <header class="upload-queue-panel__header">

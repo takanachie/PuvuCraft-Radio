@@ -132,8 +132,8 @@ class MediaConfig(StrictModel):
 
 class UploadsConfig(StrictModel):
     temp_dir: Path
-    queue_limit: Literal[10] = 10
-    max_concurrent: int = Field(default=3, ge=2, le=32)
+    queue_limit: Literal[20] = 20
+    max_concurrent: int = Field(default=5, ge=2, le=32)
     ready_lease_seconds: int = Field(default=120, ge=15, le=3600)
     heartbeat_interval_seconds: int = Field(default=5, ge=1, le=60)
     heartbeat_timeout_seconds: int = Field(default=15, ge=3, le=300)
