@@ -181,6 +181,7 @@ export const api = {
     async reserveUpload(
       clientId: string,
       file: File,
+      targetLibrary: string,
       confirmSimilar = false,
     ): Promise<UploadJob> {
       const payload = await request<unknown>('/api/admin/uploads', {
@@ -189,6 +190,7 @@ export const api = {
           client_id: clientId,
           filename: file.name,
           size_bytes: file.size,
+          target_library: targetLibrary,
           confirm_similar: confirmSimilar,
         },
       })

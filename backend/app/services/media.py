@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings
 from ..errors import ApiError
-from ..models import Track, utcnow
+from ..models import MusicLibrary, Track, utcnow
 from .storage import StorageManager, StorageUnavailable
 
 
@@ -403,9 +403,16 @@ class MediaService:
         staged_path: Path,
         original_filename: str,
         *,
+        library_group: str = "default",
         job_id: str | None = None,
         status_callback: StatusCallback | None = None,
     ) -> tuple[Track, bool]:
+        if db.get(MusicLibrary, library_group) is None:
+            raise ApiError(
+                404,
+                "target_music_library_not_found",
+                "目标音乐库不存在，请重新选择",
+            )
         original_extension = self.validate_filename(original_filename)
         normalized_path: Path | None = None
         placement_path: Path | None = None
@@ -483,7 +490,7 @@ class MediaService:
             cover_name = self._write_cover(metadata)
             now = utcnow()
             track = Track(
-                library_group="default",
+                library_group=library_group,
                 storage_id=placement.storage_id,
                 storage_name=placement.storage_name,
                 original_filename=Path(original_filename).name,

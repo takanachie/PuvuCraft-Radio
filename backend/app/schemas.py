@@ -152,6 +152,7 @@ class UploadReservationInput(ApiModel):
     client_id: str
     filename: str = Field(min_length=1, max_length=512)
     size_bytes: int = Field(gt=0)
+    target_library: str = Field(default="default", min_length=1, max_length=80)
     confirm_similar: bool = False
 
     @field_validator("client_id")
@@ -160,6 +161,11 @@ class UploadReservationInput(ApiModel):
         if not UPLOAD_CLIENT_RE.fullmatch(value):
             raise ValueError("上传客户端标识无效")
         return value
+
+    @field_validator("target_library")
+    @classmethod
+    def target_library_format(cls, value: str) -> str:
+        return validate_library_name(value)
 
 
 class UploadPreflightInput(ApiModel):

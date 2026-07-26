@@ -246,6 +246,7 @@ export interface UploadJob {
   }
   client_id: string
   original_filename: string
+  target_library: string | null
   declared_size_bytes: number
   bytes_received: number
   status: UploadJobStatus

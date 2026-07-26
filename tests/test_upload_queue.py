@@ -13,7 +13,12 @@ from .conftest import csrf_headers
 CLIENT_ID = "queue-test-client-000000000001"
 
 
-def _reserve(client: TestClient, index: int):
+def _reserve(
+    client: TestClient,
+    index: int,
+    *,
+    target_library: str = "default",
+):
     return client.post(
         "/api/admin/uploads",
         headers=csrf_headers(client),
@@ -21,6 +26,7 @@ def _reserve(client: TestClient, index: int):
             "client_id": CLIENT_ID,
             "filename": f"track-{index}.mp3",
             "size_bytes": 1024 + index,
+            "target_library": target_library,
         },
     )
 
@@ -136,7 +142,12 @@ def test_similar_name_search_is_global_across_music_libraries(
 ) -> None:
     client = initialized_admin
     with client.app.state.database.session_factory.begin() as db:
-        db.add(MusicLibrary(name="archive"))
+        db.add_all(
+            [
+                MusicLibrary(name="archive"),
+                MusicLibrary(name="incoming"),
+            ]
+        )
         db.flush()
         db.add(
             Track(
@@ -184,6 +195,7 @@ def test_similar_name_search_is_global_across_music_libraries(
             "client_id": CLIENT_ID,
             "filename": "Example Artist - Example Song.mp3",
             "size_bytes": 2048,
+            "target_library": "incoming",
         },
     )
     assert response.status_code == 409
@@ -198,10 +210,130 @@ def test_similar_name_search_is_global_across_music_libraries(
             "client_id": CLIENT_ID,
             "filename": "Example Artist - Example Song.mp3",
             "size_bytes": 2048,
+            "target_library": "incoming",
             "confirm_similar": True,
         },
     )
     assert confirmed.status_code == 201
+    assert confirmed.json()["job"]["target_library"] == "incoming"
+
+
+def test_upload_target_library_is_persisted_and_used_for_import(
+    initialized_admin: TestClient,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    client = initialized_admin
+    missing = _reserve(client, 80, target_library="missing")
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "target_music_library_not_found"
+
+    with client.app.state.database.session_factory.begin() as db:
+        db.add(MusicLibrary(name="archive"))
+
+    reserved = _reserve(client, 81, target_library="archive")
+    assert reserved.status_code == 201, reserved.text
+    job_id = reserved.json()["job"]["id"]
+    assert reserved.json()["job"]["target_library"] == "archive"
+    with client.app.state.database.session_factory.begin() as db:
+        job = db.get(UploadJob, job_id)
+        assert job is not None
+        job.status = "verifying"
+        job.bytes_received = job.declared_size_bytes
+
+    captured: dict[str, str] = {}
+
+    def imported(
+        db,
+        _staged_path,
+        original_filename,
+        *,
+        library_group,
+        **_kwargs,
+    ):
+        captured["library_group"] = library_group
+        track = Track(
+            library_group=library_group,
+            storage_id="primary",
+            storage_name="target-library.flac",
+            original_filename=original_filename,
+            sha256="c" * 64,
+            file_size_bytes=4096,
+            mime_type="audio/flac",
+            audio_stream_index=0,
+            duration_seconds=180,
+            sample_rate=48000,
+            channels=2,
+            bits_per_sample=24,
+            normalized=False,
+            title="Target Library",
+            artist="Example Artist",
+            album="",
+            available=True,
+        )
+        db.add(track)
+        db.commit()
+        db.refresh(track)
+        return track, False
+
+    monkeypatch.setattr(client.app.state.media, "import_staged", imported)
+    client.app.state.uploads._process_sync(job_id, tmp_path / "unused.mp3")
+
+    assert captured["library_group"] == "archive"
+    with client.app.state.database.session_factory() as db:
+        job = db.get(UploadJob, job_id)
+        assert job is not None
+        assert job.status == "completed"
+        assert job.target_library == "archive"
+        assert job.track is not None
+        assert job.track.library_group == "archive"
+
+
+def test_active_upload_target_follows_rename_and_blocks_library_delete(
+    initialized_admin: TestClient,
+) -> None:
+    client = initialized_admin
+    headers = csrf_headers(client)
+    created = client.post(
+        "/api/admin/track-libraries",
+        headers=headers,
+        json={"name": "incoming"},
+    )
+    assert created.status_code == 201
+    reserved = _reserve(client, 82, target_library="incoming")
+    assert reserved.status_code == 201
+    job_id = reserved.json()["job"]["id"]
+
+    renamed = client.patch(
+        "/api/admin/track-libraries/incoming",
+        headers=headers,
+        json={"name": "incoming-renamed"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    snapshot = client.get("/api/admin/uploads").json()
+    job = next(item for item in snapshot["jobs"] if item["id"] == job_id)
+    assert job["target_library"] == "incoming-renamed"
+
+    blocked = client.delete(
+        "/api/admin/track-libraries/incoming-renamed",
+        headers=headers,
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["code"] == "music_library_has_active_uploads"
+
+    assert client.delete(
+        f"/api/admin/uploads/{job_id}",
+        headers=headers,
+    ).status_code == 204
+    removed = client.delete(
+        "/api/admin/track-libraries/incoming-renamed",
+        headers=headers,
+    )
+    assert removed.status_code == 204
+    with client.app.state.database.session_factory() as db:
+        stored = db.get(UploadJob, job_id)
+        assert stored is not None
+        assert stored.target_library is None
 
 
 def test_sha_duplicate_result_is_automatically_rejected(

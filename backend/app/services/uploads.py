@@ -18,7 +18,7 @@ from starlette.requests import ClientDisconnect
 
 from ..database import Database
 from ..errors import ApiError
-from ..models import AuditEvent, UploadJob, User, utcnow
+from ..models import AuditEvent, MusicLibrary, UploadJob, User, utcnow
 from ..security import aware_utc
 from ..serializers import iso
 from .media import MediaService
@@ -149,6 +149,7 @@ class UploadManager:
             },
             "client_id": job.client_id,
             "original_filename": job.original_filename,
+            "target_library": job.target_library,
             "declared_size_bytes": job.declared_size_bytes,
             "bytes_received": job.bytes_received,
             "status": job.status,
@@ -228,6 +229,7 @@ class UploadManager:
         client_id: str,
         filename: str,
         size_bytes: int,
+        target_library: str,
         *,
         confirm_similar: bool = False,
     ) -> dict[str, object]:
@@ -237,18 +239,30 @@ class UploadManager:
         self.media.validate_filename(filename)
         if size_bytes > self.settings.media.max_upload_bytes:
             raise ApiError(413, "file_too_large", "音频文件超过 500 MiB 上限")
-        if not confirm_similar:
-            with self.database.session_factory() as db:
-                candidates = self.media.similar_tracks(db, filename)
-            if candidates:
+        with self.database.session_factory() as db:
+            if db.get(MusicLibrary, target_library) is None:
                 raise ApiError(
-                    409,
-                    "similar_tracks_found",
-                    "检测到名称相似的已有曲目，请确认后继续上传",
-                    {"candidates": candidates},
+                    404,
+                    "target_music_library_not_found",
+                    "目标音乐库不存在，请重新选择",
                 )
+            if not confirm_similar:
+                candidates = self.media.similar_tracks(db, filename)
+                if candidates:
+                    raise ApiError(
+                        409,
+                        "similar_tracks_found",
+                        "检测到名称相似的已有曲目，请确认后继续上传",
+                        {"candidates": candidates},
+                    )
         now = utcnow()
         with self._reservation_lock, self.database.session_factory.begin() as db:
+            if db.get(MusicLibrary, target_library) is None:
+                raise ApiError(
+                    404,
+                    "target_music_library_not_found",
+                    "目标音乐库不存在，请重新选择",
+                )
             occupied = (
                 db.scalar(
                     select(func.count(UploadJob.id)).where(
@@ -264,6 +278,7 @@ class UploadManager:
                 owner_user_id=owner.id,
                 client_id=client_id,
                 original_filename=filename,
+                target_library=target_library,
                 declared_size_bytes=size_bytes,
                 bytes_received=0,
                 status="queued",
@@ -519,10 +534,18 @@ class UploadManager:
                 return
             filename = job.original_filename
             owner_id = job.owner_user_id
+            target_library = job.target_library
+            if target_library is None:
+                raise ApiError(
+                    409,
+                    "target_music_library_removed",
+                    "目标音乐库已被删除，请重新提交上传任务",
+                )
             track, duplicate = self.media.import_staged(
                 db,
                 path,
                 filename,
+                library_group=target_library,
                 job_id=job.id,
                 status_callback=lambda status: self._set_stage(job_id, status),
             )
@@ -556,6 +579,8 @@ class UploadManager:
                     details={
                         "duplicate": duplicate,
                         "upload_job_id": job_id,
+                        "target_library": target_library,
+                        "track_library": track.library_group,
                         **({"reason": "sha256_match"} if duplicate else {}),
                     },
                 )

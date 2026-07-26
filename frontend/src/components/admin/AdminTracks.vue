@@ -51,6 +51,7 @@ const UPLOAD_LABELS: Record<UploadJobStatus, string> = {
 interface SubmittedUploadTask {
   id: string
   file: File
+  targetLibrary: string
   similarities: SimilarTrackCandidate[]
 }
 
@@ -138,6 +139,10 @@ const currentLibraryTrackCount = computed(() =>
 )
 const visibleUploadJobs = computed(() =>
   uploadQueue.value.jobs.filter((job) => VISIBLE_UPLOADS.has(job.status)),
+)
+const currentLibraryTargetUploadCount = computed(() =>
+  submittedUploads.value.filter((task) => task.targetLibrary === libraryGroup.value).length
+  + visibleUploadJobs.value.filter((job) => job.target_library === libraryGroup.value).length,
 )
 const pendingUploadBytes = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
@@ -256,6 +261,25 @@ function normalizeLibraryGroups(groups: string[]): string[] {
   return unique
 }
 
+async function refreshLibraryRegistry() {
+  try {
+    const libraries = await api.admin.trackLibraries()
+    libraryGroups.value = normalizeLibraryGroups(
+      libraries.map((library) => library.name),
+    )
+  } catch {
+    // Keep the last registry snapshot; callers may already have removed a stale name.
+  }
+  if (libraryGroups.value.includes(libraryGroup.value)) return
+  libraryGroup.value = 'default'
+  renamedLibraryName.value = 'default'
+  selectedTrackIds.value = new Set()
+  moveTargetLibrary.value = ''
+  cancelEdit()
+  trackPage.value = 1
+  await load(false, false, 1)
+}
+
 async function createLibrary() {
   const name = newLibraryName.value.trim()
   if (!name || librarySaving.value) return
@@ -290,6 +314,7 @@ async function renameLibrary() {
     || name === currentName
     || librarySaving.value
     || loading.value
+    || feedingSubmitted.value
   ) return
   clearMessages()
   librarySaving.value = true
@@ -302,10 +327,16 @@ async function renameLibrary() {
     libraryGroup.value = resolvedName
     renamedLibraryName.value = resolvedName
     if (moveTargetLibrary.value === currentName) moveTargetLibrary.value = resolvedName
+    submittedUploads.value = submittedUploads.value.map((task) => (
+      task.targetLibrary === currentName
+        ? { ...task, targetLibrary: resolvedName }
+        : task
+    ))
     selectedTrackIds.value = new Set()
     cancelEdit()
     trackPage.value = 1
     await load(false, false, 1)
+    await refreshUploadQueue()
     notice.value = `音乐库“${currentName}”已重命名为“${resolvedName}”。`
   } catch (cause) {
     error.value = userFacingError(cause, '无法重命名音乐库')
@@ -319,6 +350,7 @@ async function deleteLibrary() {
   if (
     name === 'default'
     || currentLibraryTrackCount.value > 0
+    || currentLibraryTargetUploadCount.value > 0
     || librarySaving.value
     || loading.value
   ) return
@@ -465,8 +497,12 @@ function isSupportedAudioFile(file: File): boolean {
   return AUDIO_EXTENSIONS.has(file.name.slice(dot).toLocaleLowerCase())
 }
 
-function stageFiles(files: File[], source: 'files' | 'directory') {
-  if (!files.length) return
+function stageFiles(
+  files: File[],
+  source: 'files' | 'directory',
+  ignoredUnsupported = 0,
+) {
+  if (!files.length && !ignoredUnsupported) return
   clearMessages()
   uploadReviewError.value = ''
   const existingKeys = new Set([
@@ -476,7 +512,7 @@ function stageFiles(files: File[], source: 'files' | 'directory') {
   ])
   const additions: File[] = []
   let duplicateCount = 0
-  let unsupportedCount = 0
+  let unsupportedCount = ignoredUnsupported
   let overflowCount = 0
 
   for (const file of files) {
@@ -543,7 +579,13 @@ function chooseDirectory(event: Event) {
     input.value = ''
     return
   }
-  stageFiles(Array.from(input.files || []), 'directory')
+  const scannedFiles = Array.from(input.files || [])
+  const supportedFiles = scannedFiles.filter(isSupportedAudioFile)
+  stageFiles(
+    supportedFiles,
+    'directory',
+    scannedFiles.length - supportedFiles.length,
+  )
   input.value = ''
 }
 
@@ -851,6 +893,7 @@ function scheduleSubmittedUploads() {
 function returnSubmittedTaskForReview(
   task: SubmittedUploadTask,
   candidates: SimilarTrackCandidate[],
+  message = `“${task.file.name}”的相似度结果在等待期间发生变化，请重新确认。`,
 ) {
   submittedUploads.value = submittedUploads.value.filter((item) => item.id !== task.id)
   if (
@@ -862,7 +905,7 @@ function returnSubmittedTaskForReview(
   }
   updateFileSimilarities(task.file, candidates)
   uploadReviewNotice.value = ''
-  uploadReviewError.value = `“${task.file.name}”的相似度结果在等待期间发生变化，请重新确认。`
+  uploadReviewError.value = message
   uploadReviewOpen.value = true
   void nextTick(() => uploadReviewSearchInput.value?.focus())
 }
@@ -910,12 +953,29 @@ async function pushSubmittedUploads() {
         job = await api.admin.reserveUpload(
           uploadClientId,
           task.file,
+          task.targetLibrary,
           latestCandidates.length > 0,
         )
       } catch (cause) {
         const candidates = similarTrackCandidates(cause)
         if (candidates.length) {
           returnSubmittedTaskForReview(task, candidates)
+          shouldContinue = true
+          continue
+        }
+        if (
+          isApiError(cause)
+          && ['target_music_library_not_found', 'target_music_library_removed'].includes(cause.code)
+        ) {
+          returnSubmittedTaskForReview(
+            task,
+            latestCandidates,
+            `“${task.file.name}”原定上传至“${task.targetLibrary}”，但该音乐库已不存在。请重新选择目标曲库并确认。`,
+          )
+          libraryGroups.value = libraryGroups.value.filter(
+            (group) => group !== task.targetLibrary,
+          )
+          await refreshLibraryRegistry()
           shouldContinue = true
           continue
         }
@@ -994,6 +1054,7 @@ async function commitSelectedFiles() {
   committing.value = true
   uploadReviewError.value = ''
   let committedCount = 0
+  let committedTargetLibrary = ''
   try {
     const preflightComplete = await preflightPendingFiles()
     if (!preflightComplete) return
@@ -1007,10 +1068,13 @@ async function commitSelectedFiles() {
     }
 
     clearMessages()
+    const targetLibrary = libraryGroup.value
+    committedTargetLibrary = targetLibrary
     const files = [...selectedFiles.value]
     const tasks = files.map((file) => ({
       id: createUploadClientId(),
       file,
+      targetLibrary,
       similarities: [...pendingFileSimilarities(file)],
     }))
     submittedUploads.value = [...submittedUploads.value, ...tasks]
@@ -1028,7 +1092,7 @@ async function commitSelectedFiles() {
     committing.value = false
   }
   if (committedCount) {
-    notice.value = `已将 ${committedCount} 个文件提交到本地已提交队列；公共队列出现空位后会自动推送。`
+    notice.value = `已将 ${committedCount} 个文件提交到本地已提交队列，目标音乐库为“${committedTargetLibrary}”；公共队列出现空位后会自动推送。`
     scheduleSubmittedUploads()
   }
 }
@@ -1211,7 +1275,7 @@ onBeforeUnmount(() => {
           class="visually-hidden"
           type="file"
           multiple
-          accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*"
+          accept=".mp3,.flac,.m4a,.aac,.wav,.ogg"
           :disabled="committing"
           @change="chooseFiles"
         />
@@ -1228,12 +1292,12 @@ onBeforeUnmount(() => {
         >
           管理并确认待上传清单
         </button>
-        <small class="ingest-note">名称相似时需二次确认，SHA-256 完全相同会自动驳回。确认后的全部文件会在本地等待，并持续按公共队列空位自动推送；关闭页面会清空本地等待任务、取消远端任务并清理临时文件。</small>
+        <small class="ingest-note">当前上传目标为“{{ libraryGroup }}”。名称相似时需二次确认，SHA-256 完全相同会自动驳回。确认后的全部文件会锁定目标曲库并在本地等待；关闭页面会清空本地等待任务、取消远端任务并清理临时文件。</small>
       </div>
       <div class="ingest-rack__scan">
         <span class="eyebrow">Local directory</span>
         <strong>扫描本地音频目录</strong>
-        <p>由操作者选择本机目录；浏览器会递归读取其中支持的音频文件，并先加入可编辑的待上传清单，不会立即占用公共队列。</p>
+        <p>由操作者选择本机目录；浏览器枚举目录后会先按 MP3 / FLAC / M4A / AAC / WAV / OGG 扩展名过滤，其他文件不会进入待上传清单。</p>
         <label
           class="button button--quiet upload-picker-button"
           :class="{ disabled: committing }"
@@ -1248,7 +1312,7 @@ onBeforeUnmount(() => {
           type="file"
           multiple
           webkitdirectory
-          accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*"
+          accept=".mp3,.flac,.m4a,.aac,.wav,.ogg"
           :disabled="committing"
           @change="chooseDirectory"
         />
@@ -1274,7 +1338,7 @@ onBeforeUnmount(() => {
               <span class="eyebrow">Upload staging</span>
               <h3 id="upload-review-title">确认待上传清单</h3>
               <p id="upload-review-description">
-                提交前可移除文件；名称相似项会高亮显示，并要求逐项二次确认。
+                提交前可移除文件；名称相似项会高亮显示，并要求逐项二次确认。提交时将锁定目标音乐库“{{ libraryGroup }}”。
               </p>
             </div>
             <button
@@ -1308,6 +1372,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="batch-add-tab__selection-tools">
               <span>
+                目标音乐库“{{ libraryGroup }}” ·
                 {{ selectedFiles.length }} 个文件 · {{ formatFileSize(pendingUploadBytes) }}
                 <template v-if="preflighting"> · 正在检查相似度</template>
                 <template v-if="invalidPendingCount"> · {{ invalidPendingCount }} 个文件不可上传</template>
@@ -1409,7 +1474,7 @@ onBeforeUnmount(() => {
 
           <footer class="batch-add-tab__footer">
             <span>
-              确认后，全部 {{ selectedFiles.length }} 个文件都会进入本地已提交队列；即使公共队列已满，也会继续等待并在空位出现时自动推送。
+              确认后，全部 {{ selectedFiles.length }} 个文件都会以“{{ libraryGroup }}”为目标进入本地已提交队列；即使公共队列已满，也会继续等待并在空位出现时自动推送。
             </span>
             <div>
               <button class="button button--quiet" type="button" :disabled="committing" @click="closeUploadReview">
@@ -1432,7 +1497,7 @@ onBeforeUnmount(() => {
                     ? '正在提交…'
                     : preflighting
                       ? '正在检查相似度…'
-                      : `确认提交 ${selectedFiles.length} 个本地任务`
+                      : `提交 ${selectedFiles.length} 个任务至 ${libraryGroup}`
                 }}
               </button>
             </div>
@@ -1467,10 +1532,10 @@ onBeforeUnmount(() => {
       </InlineNotice>
       <div class="data-frame local-upload-queue__frame">
         <table class="console-table local-upload-queue-table">
-          <thead><tr><th>顺序</th><th>文件</th><th>大小</th><th>本地阶段</th><th class="align-right">操作</th></tr></thead>
+          <thead><tr><th>顺序</th><th>文件</th><th>目标音乐库</th><th>大小</th><th>本地阶段</th><th class="align-right">操作</th></tr></thead>
           <tbody>
             <tr v-if="!submittedUploads.length">
-              <td colspan="5" class="table-message">没有等待推送至公共队列的本地任务。</td>
+              <td colspan="6" class="table-message">没有等待推送至公共队列的本地任务。</td>
             </tr>
             <template v-else>
               <tr v-for="(task, index) in submittedUploads" :key="task.id">
@@ -1479,6 +1544,7 @@ onBeforeUnmount(() => {
                   <strong>{{ task.file.name }}</strong>
                   <small v-if="pendingFilePath(task.file) !== task.file.name">{{ pendingFilePath(task.file) }}</small>
                 </td>
+                <td data-label="目标音乐库"><span class="mono-label">{{ task.targetLibrary }}</span></td>
                 <td data-label="大小">{{ formatFileSize(task.file.size) }}</td>
                 <td data-label="本地阶段">
                   <StatusBadge
@@ -1517,10 +1583,10 @@ onBeforeUnmount(() => {
       </header>
       <div class="data-frame">
         <table class="console-table upload-queue-table">
-          <thead><tr><th>文件</th><th>申请人</th><th>进度</th><th>阶段</th><th>存储</th><th class="align-right">操作</th></tr></thead>
+          <thead><tr><th>文件</th><th>申请人</th><th>目标音乐库</th><th>进度</th><th>阶段</th><th>存储</th><th class="align-right">操作</th></tr></thead>
           <tbody>
-            <tr v-if="queueLoading"><td colspan="6" class="table-message">正在连接公共上传队列…</td></tr>
-            <tr v-else-if="!visibleUploadJobs.length"><td colspan="6" class="table-message">上传队列为空。</td></tr>
+            <tr v-if="queueLoading"><td colspan="7" class="table-message">正在连接公共上传队列…</td></tr>
+            <tr v-else-if="!visibleUploadJobs.length"><td colspan="7" class="table-message">上传队列为空。</td></tr>
             <template v-else>
               <tr v-for="job in visibleUploadJobs" :key="job.id">
                 <td data-label="文件">
@@ -1530,6 +1596,9 @@ onBeforeUnmount(() => {
                 <td data-label="申请人">
                   <strong>{{ job.owner.username }}</strong>
                   <small>{{ isOwnedJob(job) ? '本页面任务' : '其他管理员' }}</small>
+                </td>
+                <td data-label="目标音乐库">
+                  <span class="mono-label">{{ job.target_library || '已删除' }}</span>
                 </td>
                 <td data-label="进度">
                   <div class="upload-progress">
@@ -1609,6 +1678,7 @@ onBeforeUnmount(() => {
             :disabled="
               librarySaving
               || loading
+              || feedingSubmitted
               || libraryGroup === 'default'
               || !renamedLibraryName.trim()
               || renamedLibraryName.trim() === libraryGroup
@@ -1625,6 +1695,7 @@ onBeforeUnmount(() => {
               || loading
               || libraryGroup === 'default'
               || currentLibraryTrackCount > 0
+              || currentLibraryTargetUploadCount > 0
             "
             @click="deleteLibrary"
           >
@@ -1634,6 +1705,9 @@ onBeforeUnmount(() => {
         <small v-if="libraryGroup === 'default'">default 是系统音乐库，不能重命名或删除。</small>
         <small v-else-if="currentLibraryTrackCount > 0">
           当前库还有 {{ currentLibraryTrackCount }} 首曲目；全部迁走后才能删除。
+        </small>
+        <small v-else-if="currentLibraryTargetUploadCount > 0">
+          仍有 {{ currentLibraryTargetUploadCount }} 个本地或公共上传任务以当前库为目标，结束后才能删除。
         </small>
         <small v-else>当前音乐库为空，可以安全删除。</small>
       </div>

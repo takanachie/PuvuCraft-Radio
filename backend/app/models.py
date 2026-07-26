@@ -159,6 +159,17 @@ class UploadJob(Base):
     )
     client_id: Mapped[str] = mapped_column(String(64), index=True)
     original_filename: Mapped[str] = mapped_column(String(512))
+    target_library: Mapped[str | None] = mapped_column(
+        String(80),
+        ForeignKey(
+            "music_libraries.name",
+            ondelete="SET NULL",
+            onupdate="CASCADE",
+        ),
+        default="default",
+        server_default="default",
+        index=True,
+    )
     declared_size_bytes: Mapped[int] = mapped_column(Integer)
     bytes_received: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)

@@ -401,6 +401,7 @@ def create_music_library(
 def rename_music_library(
     library_name: str,
     payload: MusicLibraryUpdate,
+    request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
@@ -442,12 +443,14 @@ def rename_music_library(
     renamed = db.get(MusicLibrary, payload.name)
     if renamed is None:
         raise ApiError(500, "music_library_rename_failed", "音乐库重命名失败")
+    request.app.state.uploads.refresh_snapshot()
     return {"library": _music_library_dict(db, renamed)}
 
 
 @router.delete("/track-libraries/{library_name}", status_code=204)
 def delete_music_library(
     library_name: str,
+    request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> None:
@@ -464,6 +467,20 @@ def delete_music_library(
     )
     if track_count:
         raise ApiError(409, "music_library_not_empty", "音乐库非空，请先迁移其中的曲目")
+    active_upload = db.scalar(
+        select(UploadJob.id)
+        .where(
+            UploadJob.target_library == library_name,
+            UploadJob.status.in_(CAPACITY_STATUSES),
+        )
+        .limit(1)
+    )
+    if active_upload is not None:
+        raise ApiError(
+            409,
+            "music_library_has_active_uploads",
+            "仍有上传任务以该音乐库为目标，请先等待或取消这些任务",
+        )
     audit(
         db,
         admin,
@@ -481,6 +498,7 @@ def delete_music_library(
             "music_library_not_empty",
             "音乐库非空，请先迁移其中的曲目",
         ) from exc
+    request.app.state.uploads.refresh_snapshot()
 
 
 @router.get("/tracks")
