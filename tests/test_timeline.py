@@ -2,8 +2,20 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from sqlalchemy import select
+
 from backend.app.database import Database
-from backend.app.models import Channel, PlaybackState, PlaylistItem, Track, utcnow
+from backend.app.models import (
+    PLAYBACK_HISTORY_LIMIT,
+    Channel,
+    PlaybackHistory,
+    PlaybackState,
+    PlaylistItem,
+    Track,
+    utcnow,
+)
+from backend.app.serializers import channel_dict
+from backend.app.services.playback import prune_playback_history
 from backend.app.services.timeline import recover_timeline
 
 
@@ -21,6 +33,49 @@ def _track(index: int, duration: float) -> Track:
         album="",
         available=True,
     )
+
+
+def test_playback_history_keeps_latest_ten_entries(settings) -> None:
+    database = Database(settings)
+    database.initialize()
+    now = utcnow()
+    with database.session_factory.begin() as db:
+        channel = db.get(Channel, 1)
+        assert channel is not None
+        track = _track(100, 30)
+        db.add(track)
+        db.flush()
+        history_rows = [
+            PlaybackHistory(
+                channel_id=channel.id,
+                track_id=track.id,
+                started_at=now + timedelta(seconds=index),
+                ended_at=now + timedelta(seconds=index + 1),
+                end_reason="completed",
+            )
+            for index in range(PLAYBACK_HISTORY_LIMIT + 3)
+        ]
+        db.add_all(history_rows)
+        db.flush()
+        expected_ids = [entry.id for entry in history_rows[-PLAYBACK_HISTORY_LIMIT:]]
+        prune_playback_history(db, channel.id)
+
+    with database.session_factory() as db:
+        retained_ids = list(
+            db.scalars(
+                select(PlaybackHistory.id)
+                .where(PlaybackHistory.channel_id == 1)
+                .order_by(PlaybackHistory.id)
+            ).all()
+        )
+        assert retained_ids == expected_ids
+        channel = db.get(Channel, 1)
+        assert channel is not None
+        response = channel_dict(db, channel, None, include_health=True)
+        recent_history = response["health"]["recent_history"]
+        assert len(recent_history) == PLAYBACK_HISTORY_LIMIT
+        assert [entry["id"] for entry in recent_history] == list(reversed(expected_ids))
+    database.close()
 
 
 def test_recovery_walks_across_tracks_and_loops(settings) -> None:

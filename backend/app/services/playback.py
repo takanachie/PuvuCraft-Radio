@@ -12,12 +12,13 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from sqlalchemy import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy import delete, desc, select
+from sqlalchemy.orm import Session, joinedload
 
 from ..config import Settings
 from ..database import Database
 from ..models import (
+    PLAYBACK_HISTORY_LIMIT,
     Channel,
     PlaybackHistory,
     PlaybackState,
@@ -38,6 +39,20 @@ from .timeline import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def prune_playback_history(db: Session, channel_id: int) -> None:
+    stale_ids = (
+        select(PlaybackHistory.id)
+        .where(PlaybackHistory.channel_id == channel_id)
+        .order_by(desc(PlaybackHistory.id))
+        .offset(PLAYBACK_HISTORY_LIMIT)
+    )
+    db.execute(
+        delete(PlaybackHistory)
+        .where(PlaybackHistory.id.in_(stale_ids))
+        .execution_options(synchronize_session=False)
+    )
 
 
 @dataclass(frozen=True)
@@ -67,6 +82,10 @@ class PlaybackManager:
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._clean_stale_hls()
+        with self.database.session_factory.begin() as db:
+            channel_ids = db.scalars(select(PlaybackHistory.channel_id).distinct()).all()
+            for channel_id in channel_ids:
+                prune_playback_history(db, channel_id)
         if not self.settings.streaming.always_on:
             return
         with self.database.session_factory() as db:
@@ -794,6 +813,7 @@ class ChannelSupervisor:
                 track.updated_at = now
             db.flush()
             history_id = history.id
+            prune_playback_history(db, self.channel_id)
         self._publish_snapshot()
         return history_id
 

@@ -28,6 +28,7 @@ from ..schemas import (
     ChannelCreate,
     ChannelUpdate,
     PlaylistAdd,
+    PlaylistBatchAdd,
     PlaylistItemUpdate,
     PlaylistReorder,
     TrackUpdate,
@@ -556,6 +557,88 @@ def add_playlist_item(
     _playlist_changed(request, channel)
     current_id = channel.playback_state.current_item_id if channel.playback_state else None
     return {"item": playlist_item_dict(item, current_id)}
+
+
+@router.post("/channels/{channel_id}/playlist/batch", status_code=201)
+def add_playlist_items(
+    channel_id: int,
+    payload: PlaylistBatchAdd,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    channel = _get_channel(db, channel_id)
+    existing_track_ids = set(
+        db.scalars(
+            select(PlaylistItem.track_id).where(
+                PlaylistItem.channel_id == channel_id,
+                PlaylistItem.track_id.in_(payload.track_ids),
+            )
+        ).all()
+    )
+    pending_track_ids = [
+        track_id for track_id in payload.track_ids if track_id not in existing_track_ids
+    ]
+    if not pending_track_ids:
+        return {"items": [], "skipped_existing": len(existing_track_ids)}
+
+    tracks = list(db.scalars(select(Track).where(Track.id.in_(pending_track_ids))).all())
+    tracks_by_id = {track.id: track for track in tracks}
+    unavailable_track_ids = [
+        track_id
+        for track_id in pending_track_ids
+        if track_id not in tracks_by_id or not tracks_by_id[track_id].available
+    ]
+    if unavailable_track_ids:
+        raise ApiError(
+            404,
+            "tracks_unavailable",
+            "部分曲目不存在或当前不可用",
+            {"track_ids": unavailable_track_ids},
+        )
+
+    max_position = db.scalar(
+        select(func.max(PlaylistItem.position)).where(PlaylistItem.channel_id == channel_id)
+    )
+    start_position = (max_position if max_position is not None else -1) + 1
+    items = [
+        PlaylistItem(
+            channel_id=channel_id,
+            track=tracks_by_id[track_id],
+            position=start_position + offset,
+        )
+        for offset, track_id in enumerate(pending_track_ids)
+    ]
+    db.add_all(items)
+    channel.playlist_version += 1
+    channel.updated_at = utcnow()
+    audit(
+        db,
+        admin,
+        "playlist.items_added",
+        "channel",
+        channel.id,
+        {
+            "track_ids": pending_track_ids,
+            "count": len(items),
+            "skipped_existing": len(existing_track_ids),
+        },
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "playlist_batch_conflict",
+            "播放列表已被其他管理员更新，请刷新后重试",
+        ) from exc
+    _playlist_changed(request, channel)
+    current_id = channel.playback_state.current_item_id if channel.playback_state else None
+    return {
+        "items": [playlist_item_dict(item, current_id) for item in items],
+        "skipped_existing": len(existing_track_ids),
+    }
 
 
 @router.patch("/channels/{channel_id}/playlist/{item_id}")

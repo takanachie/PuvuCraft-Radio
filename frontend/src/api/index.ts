@@ -179,6 +179,16 @@ export const api = {
       })
       return unwrapEntity<PlaylistItem | undefined>(payload, ['item', 'playlist_item'])
     },
+    async addPlaylistItems(channelId: EntityId, trackIds: EntityId[]): Promise<PlaylistItem[]> {
+      const payload = await request<unknown>(
+        `/api/admin/channels/${id(channelId)}/playlist/batch`,
+        {
+          method: 'POST',
+          json: { track_ids: trackIds },
+        },
+      )
+      return unwrapList<PlaylistItem>(payload, ['items'])
+    },
     async updatePlaylistItem(
       channelId: EntityId,
       itemId: EntityId,

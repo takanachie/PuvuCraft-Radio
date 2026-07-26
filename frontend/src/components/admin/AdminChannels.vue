@@ -247,7 +247,7 @@ onMounted(() => void load())
           <div v-if="selected.health?.recent_history?.length" class="health-history">
             <span>RECENT PLAYBACK HISTORY</span>
             <ul>
-              <li v-for="entry in selected.health?.recent_history?.slice(0, 5) || []" :key="entry.id ?? entry.started_at">
+              <li v-for="entry in selected.health?.recent_history?.slice(0, 10) || []" :key="entry.id ?? entry.started_at">
                 <strong>{{ entry.track?.title || '未知曲目' }}</strong>
                 <small>{{ formatDateTime(entry.started_at) }} / {{ entry.reason || '正常播放' }}</small>
               </li>

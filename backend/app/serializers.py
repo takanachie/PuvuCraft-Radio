@@ -5,7 +5,15 @@ from datetime import UTC, datetime
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Channel, PlaybackHistory, PlaylistItem, Track, User, utcnow
+from .models import (
+    PLAYBACK_HISTORY_LIMIT,
+    Channel,
+    PlaybackHistory,
+    PlaylistItem,
+    Track,
+    User,
+    utcnow,
+)
 from .security import aware_utc
 
 
@@ -127,8 +135,8 @@ def channel_dict(
                 select(PlaybackHistory)
                 .options(joinedload(PlaybackHistory.track))
                 .where(PlaybackHistory.channel_id == channel.id)
-                .order_by(desc(PlaybackHistory.started_at))
-                .limit(5)
+                .order_by(desc(PlaybackHistory.id))
+                .limit(PLAYBACK_HISTORY_LIMIT)
             ).all()
         )
         result["health"] = {

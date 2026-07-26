@@ -21,6 +21,9 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+PLAYBACK_HISTORY_LIMIT = 10
+
+
 class Base(DeclarativeBase):
     pass
 

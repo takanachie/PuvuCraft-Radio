@@ -131,6 +131,19 @@ class PlaylistAdd(ApiModel):
     track_id: int = Field(gt=0)
 
 
+class PlaylistBatchAdd(ApiModel):
+    track_ids: list[int] = Field(min_length=1)
+
+    @field_validator("track_ids")
+    @classmethod
+    def valid_track_ids(cls, values: list[int]) -> list[int]:
+        if any(value <= 0 for value in values):
+            raise ValueError("曲目 ID 必须为正整数")
+        if len(values) != len(set(values)):
+            raise ValueError("批量添加不能包含重复曲目")
+        return values
+
+
 class PlaylistItemUpdate(ApiModel):
     position: int | None = Field(default=None, ge=0)
 

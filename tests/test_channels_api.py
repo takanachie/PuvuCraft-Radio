@@ -96,6 +96,61 @@ def test_channel_and_playlist_management(initialized_admin: TestClient) -> None:
     assert client.post(f"/api/admin/channels/{channel_id}/skip", headers=headers).status_code == 409
 
 
+def test_batch_add_playlist_items_is_ordered_and_skips_existing(
+    initialized_admin: TestClient,
+) -> None:
+    client = initialized_admin
+    headers = csrf_headers(client)
+    track_ids = [
+        _insert_track(client, f"batch-{index}.mp3", f"{index + 10:064x}")
+        for index in range(4)
+    ]
+    first = client.post(
+        "/api/admin/channels/1/playlist",
+        headers=headers,
+        json={"track_id": track_ids[0]},
+    )
+    assert first.status_code == 201
+
+    response = client.post(
+        "/api/admin/channels/1/playlist/batch",
+        headers=headers,
+        json={"track_ids": track_ids},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["skipped_existing"] == 1
+    assert [item["track"]["id"] for item in response.json()["items"]] == track_ids[1:]
+
+    playlist = client.get("/api/admin/channels/1/playlist")
+    assert playlist.status_code == 200
+    assert [item["track"]["id"] for item in playlist.json()] == track_ids
+
+    repeated = client.post(
+        "/api/admin/channels/1/playlist/batch",
+        headers=headers,
+        json={"track_ids": track_ids},
+    )
+    assert repeated.status_code == 201
+    assert repeated.json() == {"items": [], "skipped_existing": len(track_ids)}
+
+    extra_track_id = _insert_track(client, "batch-atomic.mp3", "f" * 64)
+    unavailable = client.post(
+        "/api/admin/channels/1/playlist/batch",
+        headers=headers,
+        json={"track_ids": [extra_track_id, 999999]},
+    )
+    assert unavailable.status_code == 404
+    playlist_after_failure = client.get("/api/admin/channels/1/playlist")
+    assert extra_track_id not in [item["track"]["id"] for item in playlist_after_failure.json()]
+
+    duplicated_input = client.post(
+        "/api/admin/channels/1/playlist/batch",
+        headers=headers,
+        json={"track_ids": [extra_track_id, extra_track_id]},
+    )
+    assert duplicated_input.status_code == 422
+
+
 def test_hls_is_protected_and_authorized_by_channel(initialized_admin: TestClient) -> None:
     client = initialized_admin
     with client.app.state.database.session_factory.begin() as db:

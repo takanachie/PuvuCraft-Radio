@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../../api'
 import { userFacingError } from '../../api/client'
 import type { Channel, PlaybackEvent, PlaybackMode, PlaylistItem, Track } from '../../api/types'
@@ -15,6 +15,11 @@ const addTrackId = ref('')
 const addTrackQuery = ref('')
 const addTrackPickerOpen = ref(false)
 const highlightedAddTrackIndex = ref(-1)
+const batchAddOpen = ref(false)
+const batchAddQuery = ref('')
+const batchAddTrackIds = ref<Set<string>>(new Set())
+const batchAddError = ref('')
+const batchAddSearchInput = ref<HTMLInputElement | null>(null)
 const loading = ref(true)
 const busy = ref(false)
 const error = ref('')
@@ -38,13 +43,17 @@ const addableTracks = computed(() =>
   ),
 )
 const filteredAddableTracks = computed(() => {
-  const needle = addTrackQuery.value.trim().toLocaleLowerCase()
-  if (!needle) return addableTracks.value
-  return addableTracks.value.filter((track) =>
-    [track.title, track.artist, track.album, track.original_filename]
-      .some((value) => value?.toLocaleLowerCase().includes(needle)),
-  )
+  return addableTracks.value.filter((track) => trackMatchesQuery(track, addTrackQuery.value))
 })
+const filteredBatchAddTracks = computed(() =>
+  addableTracks.value.filter((track) => trackMatchesQuery(track, batchAddQuery.value)),
+)
+const allFilteredBatchTracksSelected = computed(() =>
+  filteredBatchAddTracks.value.length > 0
+  && filteredBatchAddTracks.value.every(
+    (track) => batchAddTrackIds.value.has(String(track.id)),
+  ),
+)
 const highlightedAddTrackOptionId = computed(() =>
   highlightedAddTrackIndex.value >= 0
     ? `playlist-track-option-${highlightedAddTrackIndex.value}`
@@ -152,6 +161,13 @@ function addTrackLabel(track: Track): string {
   return `${track.title} — ${track.artist || '未知艺人'}`
 }
 
+function trackMatchesQuery(track: Track, query: string): boolean {
+  const needle = query.trim().toLocaleLowerCase()
+  if (!needle) return true
+  return [track.title, track.artist, track.album, track.original_filename]
+    .some((value) => value?.toLocaleLowerCase().includes(needle))
+}
+
 function resetAddTrackSelection() {
   addTrackId.value = ''
   addTrackQuery.value = ''
@@ -220,6 +236,50 @@ function closeAddTrackPicker(event: FocusEvent) {
   dismissAddTrackPicker()
 }
 
+function resetBatchAdd() {
+  batchAddOpen.value = false
+  batchAddQuery.value = ''
+  batchAddTrackIds.value = new Set()
+  batchAddError.value = ''
+}
+
+function openBatchAdd() {
+  if (busy.value || loading.value || !addableTracks.value.length) return
+  batchAddQuery.value = ''
+  batchAddTrackIds.value = new Set()
+  batchAddOpen.value = true
+  void nextTick(() => batchAddSearchInput.value?.focus())
+}
+
+function closeBatchAdd() {
+  if (!busy.value) resetBatchAdd()
+}
+
+function toggleBatchTrack(track: Track) {
+  const trackId = String(track.id)
+  const selected = new Set(batchAddTrackIds.value)
+  if (selected.has(trackId)) selected.delete(trackId)
+  else selected.add(trackId)
+  batchAddTrackIds.value = selected
+  batchAddError.value = ''
+}
+
+function toggleFilteredBatchTracks() {
+  const selected = new Set(batchAddTrackIds.value)
+  if (allFilteredBatchTracksSelected.value) {
+    for (const track of filteredBatchAddTracks.value) selected.delete(String(track.id))
+  } else {
+    for (const track of filteredBatchAddTracks.value) selected.add(String(track.id))
+  }
+  batchAddTrackIds.value = selected
+  batchAddError.value = ''
+}
+
+function clearBatchTracks() {
+  batchAddTrackIds.value = new Set()
+  batchAddError.value = ''
+}
+
 async function addTrack() {
   const channel = currentChannel.value
   const track = addableTracks.value.find((item) => String(item.id) === addTrackId.value)
@@ -233,6 +293,31 @@ async function addTrack() {
     notice.value = `已将“${track.title}”加入播放列表。`
   } catch (cause) {
     error.value = userFacingError(cause, '曲目添加失败')
+  } finally {
+    busy.value = false
+  }
+}
+
+async function addTracksBatch() {
+  const channel = currentChannel.value
+  const selectedTracks = addableTracks.value.filter(
+    (track) => batchAddTrackIds.value.has(String(track.id)),
+  )
+  if (!channel || !selectedTracks.length || busy.value) return
+  clearMessages()
+  busy.value = true
+  try {
+    const added = await api.admin.addPlaylistItems(
+      channel.id,
+      selectedTracks.map((track) => track.id),
+    )
+    resetBatchAdd()
+    await loadPlaylist()
+    notice.value = added.length
+      ? `已批量将 ${added.length} 首曲目加入播放列表。`
+      : '所选曲目均已存在于播放列表中。'
+  } catch (cause) {
+    batchAddError.value = userFacingError(cause, '批量添加曲目失败')
   } finally {
     busy.value = false
   }
@@ -360,6 +445,7 @@ async function playNow(item: PlaylistItem) {
 
 watch(selectedChannelId, () => {
   resetAddTrackSelection()
+  resetBatchAdd()
   const channel = currentChannel.value
   if (channel) openEvents(channel.id)
   else closeEvents()
@@ -370,6 +456,14 @@ watch(addableTracks, (items) => {
   if (addTrackId.value && !items.some((track) => String(track.id) === addTrackId.value)) {
     resetAddTrackSelection()
   }
+  const allowedIds = new Set(items.map((track) => String(track.id)))
+  const retainedIds = new Set(
+    [...batchAddTrackIds.value].filter((trackId) => allowedIds.has(trackId)),
+  )
+  if (retainedIds.size !== batchAddTrackIds.value.size) {
+    batchAddTrackIds.value = retainedIds
+  }
+  if (batchAddOpen.value && !items.length) resetBatchAdd()
 })
 
 watch(filteredAddableTracks, (items) => {
@@ -470,8 +564,118 @@ onBeforeUnmount(closeEvents)
           <span v-if="!filteredAddableTracks.length" class="playlist-track-picker__empty">没有匹配的可添加曲目</span>
         </div>
       </div>
-      <button class="button button--primary" type="button" :disabled="busy || loading || !addTrackId" @click="addTrack">加入列表</button>
+      <div class="playlist-add-rack__actions">
+        <button class="button button--primary" type="button" :disabled="busy || loading || !addTrackId" @click="addTrack">加入列表</button>
+        <button class="button button--quiet" type="button" :disabled="busy || loading || !addableTracks.length" @click="openBatchAdd">批量添加</button>
+      </div>
     </section>
+
+    <Teleport to="body">
+      <div
+        v-if="batchAddOpen"
+        class="batch-add-overlay"
+        @pointerdown.self="closeBatchAdd"
+        @keydown.esc="closeBatchAdd"
+      >
+        <section
+          class="batch-add-tab"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="batch-add-title"
+        >
+          <header class="batch-add-tab__header">
+            <div>
+              <span class="eyebrow">Batch queue input</span>
+              <h3 id="batch-add-title">批量添加音乐库曲目</h3>
+              <p>当前歌单已有曲目已自动从候选中排除。</p>
+            </div>
+            <button
+              class="icon-close"
+              type="button"
+              aria-label="关闭批量添加"
+              :disabled="busy"
+              @click="closeBatchAdd"
+            >
+              ×
+            </button>
+          </header>
+
+          <div class="batch-add-tab__toolbar">
+            <InlineNotice v-if="batchAddError" class="batch-add-tab__notice" tone="danger">
+              {{ batchAddError }}
+            </InlineNotice>
+            <div class="field field--search">
+              <label for="batch-track-search">筛选音乐库</label>
+              <input
+                id="batch-track-search"
+                ref="batchAddSearchInput"
+                v-model="batchAddQuery"
+                type="search"
+                placeholder="输入标题、艺人、专辑或原文件名"
+                autocomplete="off"
+              />
+            </div>
+            <div class="batch-add-tab__selection-tools">
+              <span>{{ filteredBatchAddTracks.length }} 条候选 / 已选 {{ batchAddTrackIds.size }} 首</span>
+              <button
+                class="text-button"
+                type="button"
+                :disabled="!filteredBatchAddTracks.length"
+                @click="toggleFilteredBatchTracks"
+              >
+                {{ allFilteredBatchTracksSelected ? '取消当前筛选' : '全选当前筛选' }}
+              </button>
+              <button
+                class="text-button"
+                type="button"
+                :disabled="!batchAddTrackIds.size"
+                @click="clearBatchTracks"
+              >
+                清空选择
+              </button>
+            </div>
+          </div>
+
+          <div class="batch-add-tab__list" role="group" aria-label="批量添加候选曲目">
+            <label
+              v-for="track in filteredBatchAddTracks"
+              :key="track.id"
+              class="batch-add-track"
+              :class="{ selected: batchAddTrackIds.has(String(track.id)) }"
+            >
+              <input
+                type="checkbox"
+                :checked="batchAddTrackIds.has(String(track.id))"
+                @change="toggleBatchTrack(track)"
+              />
+              <span>
+                <strong>{{ track.title }}</strong>
+                <small>{{ track.artist || '未知艺人' }} · {{ track.album || '未标注专辑' }}</small>
+              </span>
+              <small>{{ formatDuration(track.duration_seconds) }}</small>
+            </label>
+            <div v-if="!filteredBatchAddTracks.length" class="batch-add-tab__empty">
+              没有匹配且尚未加入当前歌单的曲目。
+            </div>
+          </div>
+
+          <footer class="batch-add-tab__footer">
+            <span>将按音乐库候选顺序追加到当前播放列表末尾。</span>
+            <div>
+              <button class="button button--quiet" type="button" :disabled="busy" @click="closeBatchAdd">取消</button>
+              <button
+                class="button button--primary"
+                type="button"
+                :disabled="busy || !batchAddTrackIds.size"
+                @click="addTracksBatch"
+              >
+                {{ busy ? '正在添加…' : `添加所选 ${batchAddTrackIds.size} 首` }}
+              </button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </Teleport>
 
     <div class="playlist-admin-meta">
       <span>{{ playlist.length }} ITEMS</span>
