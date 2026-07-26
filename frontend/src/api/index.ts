@@ -196,10 +196,11 @@ export const api = {
       })
       return unwrapEntity<UploadJob>(payload, ['job'])
     },
-    async heartbeatUploads(clientId: string): Promise<void> {
+    async heartbeatUploads(clientId: string, signal?: AbortSignal): Promise<void> {
       await request('/api/admin/uploads/heartbeat', {
         method: 'POST',
         json: { client_id: clientId },
+        signal,
       })
     },
     async cancelUpload(jobId: string): Promise<void> {

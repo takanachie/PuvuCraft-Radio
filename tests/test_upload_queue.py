@@ -3,14 +3,25 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from backend.app import database as database_module
+from backend.app.dependencies import get_db
+from backend.app.main import create_app
 from backend.app.models import AuditEvent, MusicLibrary, Track, UploadJob, utcnow
 
 from .conftest import csrf_headers
 
 CLIENT_ID = "queue-test-client-000000000001"
+
+
+def _dependency_calls(dependant) -> set[object]:
+    calls = {dependant.call}
+    for dependency in dependant.dependencies:
+        calls.update(_dependency_calls(dependency))
+    return calls
 
 
 def _reserve(
@@ -47,6 +58,65 @@ def _wait_for_job_status(
             return job
         time.sleep(0.05)
     raise AssertionError(f"upload job did not reach {statuses}: {job}")
+
+
+def test_upload_routes_do_not_hold_request_scoped_database_sessions(app) -> None:
+    routes = [
+        route
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/admin/uploads")
+    ]
+    assert routes
+    for route in routes:
+        assert get_db not in _dependency_calls(route.dependant), route.path
+
+
+def test_upload_heartbeat_succeeds_with_a_single_database_connection(
+    settings,
+    monkeypatch,
+) -> None:
+    create_engine = database_module.create_engine
+
+    def create_single_connection_engine(url, **kwargs):
+        return create_engine(
+            url,
+            **kwargs,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=0.2,
+        )
+
+    monkeypatch.setattr(database_module, "create_engine", create_single_connection_engine)
+    with TestClient(create_app(settings)) as client:
+        token = settings.paths.bootstrap_token_file.read_text(encoding="utf-8").strip()
+        setup = client.post(
+            "/api/setup",
+            json={
+                "token": token,
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "secure-admin-password",
+            },
+        )
+        assert setup.status_code == 201, setup.text
+        login = client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "secure-admin-password"},
+        )
+        assert login.status_code == 200, login.text
+
+        without_csrf = client.post(
+            "/api/admin/uploads/heartbeat",
+            json={"client_id": CLIENT_ID},
+        )
+        assert without_csrf.status_code == 403
+        response = client.post(
+            "/api/admin/uploads/heartbeat",
+            headers=csrf_headers(client),
+            json={"client_id": CLIENT_ID},
+        )
+        assert response.status_code == 204, response.text
+        assert client.app.state.database.engine.pool.checkedout() == 0
 
 
 def test_public_queue_enforces_capacity_and_parallel_limit(

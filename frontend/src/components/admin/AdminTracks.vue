@@ -12,6 +12,7 @@ import type {
   UploadQueueSnapshot,
 } from '../../api/types'
 import { formatDuration, formatFileSize } from '../../utils/format'
+import { SingleFlightRequest } from '../../utils/singleFlightRequest'
 import InlineNotice from '../InlineNotice.vue'
 import StatusBadge from '../StatusBadge.vue'
 
@@ -73,6 +74,7 @@ const search = ref('')
 const libraryGroup = ref('default')
 const libraryGroups = ref<string[]>(['default'])
 const trackPage = ref(1)
+const trackPageInput = ref('1')
 const trackPageSize = ref(10)
 const trackTotal = ref(0)
 const trackTotalPages = ref(1)
@@ -115,6 +117,7 @@ const handledTerminalJobs = new Set<string>()
 let eventSource: EventSource | null = null
 let heartbeatTimer: number | undefined
 let heartbeatSeconds = 0
+const heartbeatRequest = new SingleFlightRequest()
 let trackRequest = 0
 let appliedTrackRequest = 0
 let visibleTrackRequest = 0
@@ -208,6 +211,9 @@ async function load(preserveSelection = true, background = false, page = trackPa
     appliedTrackRequest = requestId
     tracks.value = result.items
     trackPage.value = result.page
+    if (document.activeElement?.id !== 'track-page-jump') {
+      trackPageInput.value = String(result.page)
+    }
     trackPageSize.value = result.page_size
     trackTotal.value = result.total
     trackTotalPages.value = result.total_pages
@@ -378,10 +384,25 @@ async function deleteLibrary() {
 }
 
 function goToTrackPage(page: number) {
-  const target = Math.min(Math.max(1, page), trackTotalPages.value)
-  if (target === trackPage.value || loading.value) return
+  if (loading.value) {
+    trackPageInput.value = String(trackPage.value)
+    return
+  }
+  const requested = Number.isFinite(page) ? Math.trunc(page) : trackPage.value
+  const target = Math.min(Math.max(1, requested), trackTotalPages.value)
+  trackPageInput.value = String(target)
+  if (target === trackPage.value) return
   cancelEdit()
   void load(false, false, target)
+}
+
+function jumpToTrackPage() {
+  const requested = Number(trackPageInput.value)
+  if (!Number.isInteger(requested)) {
+    trackPageInput.value = String(trackPage.value)
+    return
+  }
+  goToTrackPage(requested)
 }
 
 function toggleTrackSelection(track: Track, event: Event) {
@@ -859,8 +880,26 @@ function startHeartbeat(seconds: number) {
   if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer)
   heartbeatSeconds = nextSeconds
   heartbeatTimer = window.setInterval(() => {
-    void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
+    void sendHeartbeat()
   }, nextSeconds * 1000)
+}
+
+async function sendHeartbeat() {
+  if (
+    leaving
+    || (
+      filesByJob.size === 0
+      && !uploadQueue.value.jobs.some(
+        (job) => isOwnedJob(job) && CLIENT_BOUND_UPLOADS.has(job.status),
+      )
+    )
+  ) {
+    return
+  }
+  await heartbeatRequest.run(
+    (signal) => api.admin.heartbeatUploads(uploadClientId, signal),
+    Math.max(1000, heartbeatSeconds * 1000),
+  ).catch(() => undefined)
 }
 
 function clearSubmittedRetry() {
@@ -1017,7 +1056,7 @@ async function pushSubmittedUploads() {
       submittedQueueError.value = ''
     }
     notice.value = `已将 ${pushed} 个本地任务推送至公共上传队列。`
-    void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
+    void sendHeartbeat()
     await refreshUploadQueue()
   } else if (shouldContinue && !pushFailed) {
     scheduleSubmittedUploads()
@@ -1111,6 +1150,7 @@ async function cancelUpload(job: UploadJob) {
 
 function expireOwnedUploads() {
   leaving = true
+  heartbeatRequest.abort()
   for (const xhr of [...requestsByJob.values()]) xhr.abort()
   const csrfToken = getCookie('radio_csrf')
   const headers = new Headers({
@@ -1220,6 +1260,10 @@ watch(search, () => {
     trackPage.value = 1
     void load(false, false, 1)
   }, 250)
+})
+
+watch(trackPage, (page) => {
+  trackPageInput.value = String(page)
 })
 
 watch(libraryGroup, (value) => {
@@ -1798,7 +1842,15 @@ onBeforeUnmount(() => {
         第 {{ trackPage }} / {{ trackTotalPages }} 页 · 当前 {{ tracks.length }} 条 ·
         共 {{ trackTotal }} 条匹配结果 · 每页固定 {{ trackPageSize }} 条
       </span>
-      <div>
+      <div class="library-pagination__controls">
+        <button
+          class="button button--quiet button--small"
+          type="button"
+          :disabled="loading || trackPage <= 1"
+          @click="goToTrackPage(1)"
+        >
+          首页
+        </button>
         <button
           class="button button--quiet button--small"
           type="button"
@@ -1807,6 +1859,29 @@ onBeforeUnmount(() => {
         >
           上一页
         </button>
+        <div class="library-pagination__jump">
+          <label class="visually-hidden" for="track-page-jump">跳转到页码</label>
+          <input
+            id="track-page-jump"
+            v-model="trackPageInput"
+            type="number"
+            inputmode="numeric"
+            min="1"
+            :max="trackTotalPages"
+            :disabled="loading || trackTotalPages <= 1"
+            aria-label="输入要跳转的页码"
+            @keydown.enter.prevent="jumpToTrackPage"
+          />
+          <span>/ {{ trackTotalPages }}</span>
+          <button
+            class="button button--quiet button--small"
+            type="button"
+            :disabled="loading || trackTotalPages <= 1"
+            @click="jumpToTrackPage"
+          >
+            跳转
+          </button>
+        </div>
         <button
           class="button button--quiet button--small"
           type="button"
@@ -1814,6 +1889,14 @@ onBeforeUnmount(() => {
           @click="goToTrackPage(trackPage + 1)"
         >
           下一页
+        </button>
+        <button
+          class="button button--quiet button--small"
+          type="button"
+          :disabled="loading || trackPage >= trackTotalPages"
+          @click="goToTrackPage(trackTotalPages)"
+        >
+          尾页
         </button>
       </div>
     </div>

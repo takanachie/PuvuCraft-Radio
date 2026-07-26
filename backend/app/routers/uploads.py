@@ -8,9 +8,9 @@ import time
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 
-from ..dependencies import require_admin, require_admin_read
+from ..dependencies import require_admin_read_once, require_admin_write_once
 from ..errors import ApiError
-from ..models import User, utcnow
+from ..models import utcnow
 from ..schemas import UploadHeartbeatInput, UploadPreflightInput, UploadReservationInput
 from ..serializers import iso
 
@@ -25,7 +25,7 @@ def _manager(request: Request):
 @router.get("")
 def list_uploads(
     request: Request,
-    _admin: User = Depends(require_admin_read),
+    _admin_id: int = Depends(require_admin_read_once),
 ) -> dict[str, object]:
     return _manager(request).snapshot()
 
@@ -34,11 +34,11 @@ def list_uploads(
 def reserve_upload(
     payload: UploadReservationInput,
     request: Request,
-    admin: User = Depends(require_admin),
+    admin_id: int = Depends(require_admin_write_once),
 ) -> dict[str, object]:
     return {
         "job": _manager(request).reserve(
-            admin,
+            admin_id,
             payload.client_id,
             payload.filename,
             payload.size_bytes,
@@ -52,7 +52,7 @@ def reserve_upload(
 def preflight_uploads(
     payload: UploadPreflightInput,
     request: Request,
-    _admin: User = Depends(require_admin),
+    _admin_id: int = Depends(require_admin_write_once),
 ) -> dict[str, object]:
     return _manager(request).preflight(payload.filenames)
 
@@ -61,24 +61,24 @@ def preflight_uploads(
 def upload_heartbeat(
     payload: UploadHeartbeatInput,
     request: Request,
-    admin: User = Depends(require_admin),
+    admin_id: int = Depends(require_admin_write_once),
 ) -> None:
-    _manager(request).heartbeat(admin.id, payload.client_id)
+    _manager(request).heartbeat(admin_id, payload.client_id)
 
 
 @router.post("/expire", status_code=204)
 def expire_upload_page(
     payload: UploadHeartbeatInput,
     request: Request,
-    admin: User = Depends(require_admin),
+    admin_id: int = Depends(require_admin_write_once),
 ) -> None:
-    _manager(request).expire_client(admin.id, payload.client_id)
+    _manager(request).expire_client(admin_id, payload.client_id)
 
 
 @router.get("/events")
 async def upload_events(
     request: Request,
-    admin: User = Depends(require_admin_read),
+    _admin_id: int = Depends(require_admin_read_once),
 ) -> StreamingResponse:
     manager = _manager(request)
 
@@ -94,13 +94,10 @@ async def upload_events(
                     timed_out = True
                     payload = {}
                 if time.monotonic() >= next_auth_check:
-                    with request.app.state.database.session_factory() as db:
-                        try:
-                            login_session = request.app.state.auth.authenticate_request(request, db)
-                        except ApiError:
-                            break
-                        if login_session.user.role != "admin":
-                            break
+                    try:
+                        await asyncio.to_thread(require_admin_read_once, request)
+                    except ApiError:
+                        break
                     next_auth_check = time.monotonic() + 10
                 if timed_out:
                     yield _sse(
@@ -126,10 +123,10 @@ async def upload_content(
     job_id: str,
     request: Request,
     client_id: str = Header(alias="X-Upload-Client-ID"),
-    admin: User = Depends(require_admin),
+    admin_id: int = Depends(require_admin_write_once),
 ) -> dict[str, object]:
     _validate_job_id(job_id)
-    job = await _manager(request).receive(request, job_id, admin.id, client_id)
+    job = await _manager(request).receive(request, job_id, admin_id, client_id)
     return {"job": job}
 
 
@@ -137,7 +134,7 @@ async def upload_content(
 def cancel_upload(
     job_id: str,
     request: Request,
-    _admin: User = Depends(require_admin),
+    _admin_id: int = Depends(require_admin_write_once),
 ) -> None:
     _validate_job_id(job_id)
     _manager(request).cancel(job_id)

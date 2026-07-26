@@ -18,7 +18,7 @@ from starlette.requests import ClientDisconnect
 
 from ..database import Database
 from ..errors import ApiError
-from ..models import AuditEvent, MusicLibrary, UploadJob, User, utcnow
+from ..models import AuditEvent, MusicLibrary, UploadJob, utcnow
 from ..security import aware_utc
 from ..serializers import iso
 from .media import MediaService
@@ -225,7 +225,7 @@ class UploadManager:
 
     def reserve(
         self,
-        owner: User,
+        owner_id: int,
         client_id: str,
         filename: str,
         size_bytes: int,
@@ -275,7 +275,7 @@ class UploadManager:
                 raise ApiError(409, "upload_queue_full", "公共上传队列已满")
             job = UploadJob(
                 id=uuid.uuid4().hex,
-                owner_user_id=owner.id,
+                owner_user_id=owner_id,
                 client_id=client_id,
                 original_filename=filename,
                 target_library=target_library,

@@ -41,6 +41,26 @@ def authenticate_once(request: Request) -> int:
         return login_session.id
 
 
+def _authenticate_admin_once(request: Request, *, verify_csrf: bool) -> int:
+    """Authenticate an admin without extending the DB session to the request lifetime."""
+    auth = request.app.state.auth
+    with request.app.state.database.session_factory() as db:
+        login_session = auth.authenticate_request(request, db)
+        if verify_csrf:
+            auth.verify_csrf(request, login_session)
+        if login_session.user.role != "admin":
+            raise ApiError(403, "admin_required", "需要管理员权限")
+        return login_session.user.id
+
+
+def require_admin_read_once(request: Request) -> int:
+    return _authenticate_admin_once(request, verify_csrf=False)
+
+
+def require_admin_write_once(request: Request) -> int:
+    return _authenticate_admin_once(request, verify_csrf=True)
+
+
 def require_csrf(
     request: Request,
     login_session: LoginSession = Depends(get_login_session),
