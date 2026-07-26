@@ -12,6 +12,9 @@ const tracks = ref<Track[]>([])
 const playlist = ref<PlaylistItem[]>([])
 const selectedChannelId = ref('')
 const addTrackId = ref('')
+const addTrackQuery = ref('')
+const addTrackPickerOpen = ref(false)
+const highlightedAddTrackIndex = ref(-1)
 const loading = ref(true)
 const busy = ref(false)
 const error = ref('')
@@ -26,7 +29,27 @@ const currentChannel = computed(() =>
 const currentItemId = computed(() =>
   currentChannel.value?.playback_state?.current_item_id ?? currentChannel.value?.playback?.current_item_id,
 )
-const availableTracks = computed(() => tracks.value.filter((track) => track.available !== false))
+const playlistTrackIds = computed(() =>
+  new Set(playlist.value.map((item) => String(trackFromItem(item).id))),
+)
+const addableTracks = computed(() =>
+  tracks.value.filter(
+    (track) => track.available !== false && !playlistTrackIds.value.has(String(track.id)),
+  ),
+)
+const filteredAddableTracks = computed(() => {
+  const needle = addTrackQuery.value.trim().toLocaleLowerCase()
+  if (!needle) return addableTracks.value
+  return addableTracks.value.filter((track) =>
+    [track.title, track.artist, track.album, track.original_filename]
+      .some((value) => value?.toLocaleLowerCase().includes(needle)),
+  )
+})
+const highlightedAddTrackOptionId = computed(() =>
+  highlightedAddTrackIndex.value >= 0
+    ? `playlist-track-option-${highlightedAddTrackIndex.value}`
+    : undefined,
+)
 const totalDuration = computed(() =>
   playlist.value.reduce((sum, item) => sum + (trackFromItem(item).duration_seconds || 0), 0),
 )
@@ -125,15 +148,87 @@ function openEvents(channelId: Channel['id']) {
   }
 }
 
+function addTrackLabel(track: Track): string {
+  return `${track.title} — ${track.artist || '未知艺人'}`
+}
+
+function resetAddTrackSelection() {
+  addTrackId.value = ''
+  addTrackQuery.value = ''
+  addTrackPickerOpen.value = false
+  highlightedAddTrackIndex.value = -1
+}
+
+function openAddTrackPicker() {
+  if (busy.value || loading.value || !addableTracks.value.length) return
+  addTrackPickerOpen.value = true
+  const selectedIndex = filteredAddableTracks.value.findIndex(
+    (track) => String(track.id) === addTrackId.value,
+  )
+  if (selectedIndex >= 0) {
+    highlightedAddTrackIndex.value = selectedIndex
+    return
+  }
+  highlightedAddTrackIndex.value = filteredAddableTracks.value.length ? 0 : -1
+}
+
+function filterAddTracks() {
+  addTrackId.value = ''
+  addTrackPickerOpen.value = true
+  highlightedAddTrackIndex.value = filteredAddableTracks.value.length ? 0 : -1
+}
+
+function moveAddTrackHighlight(offset: number) {
+  if (!addTrackPickerOpen.value) openAddTrackPicker()
+  const count = filteredAddableTracks.value.length
+  if (!count) {
+    highlightedAddTrackIndex.value = -1
+    return
+  }
+  const current = highlightedAddTrackIndex.value
+  if (current < 0) {
+    highlightedAddTrackIndex.value = offset > 0 ? 0 : count - 1
+    return
+  }
+  highlightedAddTrackIndex.value = (current + offset + count) % count
+}
+
+function dismissAddTrackPicker() {
+  addTrackPickerOpen.value = false
+  highlightedAddTrackIndex.value = -1
+}
+
+function selectAddTrack(track: Track) {
+  addTrackId.value = String(track.id)
+  addTrackQuery.value = addTrackLabel(track)
+  dismissAddTrackPicker()
+}
+
+function selectHighlightedAddTrack() {
+  if (!addTrackPickerOpen.value) {
+    openAddTrackPicker()
+    return
+  }
+  const track = filteredAddableTracks.value[highlightedAddTrackIndex.value]
+  if (track) selectAddTrack(track)
+}
+
+function closeAddTrackPicker(event: FocusEvent) {
+  const picker = event.currentTarget as HTMLElement
+  const nextTarget = event.relatedTarget
+  if (nextTarget instanceof Node && picker.contains(nextTarget)) return
+  dismissAddTrackPicker()
+}
+
 async function addTrack() {
   const channel = currentChannel.value
-  const track = tracks.value.find((item) => String(item.id) === addTrackId.value)
+  const track = addableTracks.value.find((item) => String(item.id) === addTrackId.value)
   if (!channel || !track || busy.value) return
   clearMessages()
   busy.value = true
   try {
     await api.admin.addPlaylistItem(channel.id, track.id)
-    addTrackId.value = ''
+    resetAddTrackSelection()
     await loadPlaylist()
     notice.value = `已将“${track.title}”加入播放列表。`
   } catch (cause) {
@@ -264,11 +359,27 @@ async function playNow(item: PlaylistItem) {
 }
 
 watch(selectedChannelId, () => {
-  addTrackId.value = ''
+  resetAddTrackSelection()
   const channel = currentChannel.value
   if (channel) openEvents(channel.id)
   else closeEvents()
   void loadPlaylist()
+})
+
+watch(addableTracks, (items) => {
+  if (addTrackId.value && !items.some((track) => String(track.id) === addTrackId.value)) {
+    resetAddTrackSelection()
+  }
+})
+
+watch(filteredAddableTracks, (items) => {
+  if (!addTrackPickerOpen.value || !items.length) highlightedAddTrackIndex.value = -1
+  else if (
+    highlightedAddTrackIndex.value < 0
+    || highlightedAddTrackIndex.value >= items.length
+  ) {
+    highlightedAddTrackIndex.value = 0
+  }
 })
 
 onMounted(() => void loadInitial())
@@ -311,12 +422,55 @@ onBeforeUnmount(closeEvents)
     </div>
 
     <section class="playlist-add-rack" aria-labelledby="add-track-title">
-      <div><span class="eyebrow">Queue input</span><strong id="add-track-title">添加音乐库曲目</strong></div>
-      <select v-model="addTrackId" aria-label="选择要添加的曲目" :disabled="busy || !availableTracks.length">
-        <option value="">{{ availableTracks.length ? '选择曲目…' : '没有可添加的曲目' }}</option>
-        <option v-for="track in availableTracks" :key="track.id" :value="String(track.id)">{{ track.title }} — {{ track.artist || '未知艺人' }}</option>
-      </select>
-      <button class="button button--primary" type="button" :disabled="busy || !addTrackId" @click="addTrack">加入列表</button>
+      <div class="playlist-add-rack__heading"><span class="eyebrow">Queue input</span><strong id="add-track-title">添加音乐库曲目</strong></div>
+      <div class="playlist-track-picker" @focusout="closeAddTrackPicker">
+        <input
+          v-model="addTrackQuery"
+          type="text"
+          role="combobox"
+          aria-label="选择要添加的曲目"
+          aria-autocomplete="list"
+          aria-controls="playlist-track-options"
+          :aria-expanded="addTrackPickerOpen"
+          :aria-activedescendant="highlightedAddTrackOptionId"
+          :placeholder="addableTracks.length ? '选择曲目…' : '没有可添加的曲目'"
+          :disabled="busy || loading || !addableTracks.length"
+          autocomplete="off"
+          @focus="openAddTrackPicker"
+          @input="filterAddTracks"
+          @keydown.down.prevent="moveAddTrackHighlight(1)"
+          @keydown.up.prevent="moveAddTrackHighlight(-1)"
+          @keydown.enter.prevent="selectHighlightedAddTrack"
+          @keydown.esc="dismissAddTrackPicker"
+        />
+        <span class="playlist-track-picker__chevron" aria-hidden="true">⌄</span>
+        <div
+          v-if="addTrackPickerOpen"
+          id="playlist-track-options"
+          class="playlist-track-picker__options"
+          role="listbox"
+          aria-label="可添加曲目"
+        >
+          <button
+            v-for="(track, index) in filteredAddableTracks"
+            :id="`playlist-track-option-${index}`"
+            :key="track.id"
+            class="playlist-track-picker__option"
+            :class="{ active: highlightedAddTrackIndex === index }"
+            type="button"
+            role="option"
+            tabindex="-1"
+            :aria-selected="String(track.id) === addTrackId"
+            @pointerdown.prevent="selectAddTrack(track)"
+            @click="selectAddTrack(track)"
+          >
+            <strong>{{ track.title }} — {{ track.artist || '未知艺人' }}</strong>
+            <small>{{ track.album || '未标注专辑' }} · {{ formatDuration(track.duration_seconds) }}</small>
+          </button>
+          <span v-if="!filteredAddableTracks.length" class="playlist-track-picker__empty">没有匹配的可添加曲目</span>
+        </div>
+      </div>
+      <button class="button button--primary" type="button" :disabled="busy || loading || !addTrackId" @click="addTrack">加入列表</button>
     </section>
 
     <div class="playlist-admin-meta">
