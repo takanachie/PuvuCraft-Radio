@@ -276,6 +276,25 @@ class UploadManager:
         self._publish_snapshot()
         return self.get_job(job.id)
 
+    def preflight(self, filenames: list[str]) -> dict[str, object]:
+        checked_names: list[str] = []
+        for requested_name in filenames:
+            filename = Path(requested_name).name
+            if not filename:
+                raise ApiError(422, "missing_filename", "上传文件缺少名称")
+            self.media.validate_filename(filename)
+            checked_names.append(filename)
+        with self.database.session_factory() as db:
+            similarities = self.media.similar_tracks_batch(db, checked_names)
+        files = [
+            {
+                "filename": filename,
+                "candidates": similarities[filename],
+            }
+            for filename in checked_names
+        ]
+        return {"files": files}
+
     def heartbeat(self, owner_id: int, client_id: str) -> None:
         now = utcnow()
         with self.database.session_factory.begin() as db:

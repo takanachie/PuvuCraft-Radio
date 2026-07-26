@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from '../../api'
 import { getCookie, isApiError, userFacingError } from '../../api/client'
 import type {
@@ -16,6 +16,8 @@ import InlineNotice from '../InlineNotice.vue'
 import StatusBadge from '../StatusBadge.vue'
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+const MAX_PENDING_FILES = 1000
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.flac', '.m4a', '.aac', '.wav', '.ogg'])
 const CLIENT_BOUND_UPLOADS = new Set<UploadJobStatus>(['queued', 'ready', 'uploading'])
 const VISIBLE_UPLOADS = new Set<UploadJobStatus>([
   'queued',
@@ -54,14 +56,22 @@ function createUploadClientId(): string {
 const uploadClientId = createUploadClientId()
 const tracks = ref<Track[]>([])
 const loading = ref(true)
-const scanning = ref(false)
 const reserving = ref(false)
+const preflighting = ref(false)
 const saving = ref(false)
 const error = ref('')
 const notice = ref('')
 const search = ref('')
 const selectedFiles = ref<File[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
+const directoryInput = ref<HTMLInputElement | null>(null)
+const uploadReviewOpen = ref(false)
+const uploadReviewQuery = ref('')
+const uploadReviewError = ref('')
+const uploadReviewNotice = ref('')
+const uploadReviewSearchInput = ref<HTMLInputElement | null>(null)
+const similaritiesByFile = ref<Record<string, SimilarTrackCandidate[]>>({})
+const confirmedSimilarFiles = ref<Set<string>>(new Set())
 const editingId = ref<EntityId | null>(null)
 const coverFile = ref<File | null>(null)
 const editForm = reactive<TrackInput>({ title: '', artist: '', album: '', cover_url: '' })
@@ -81,10 +91,15 @@ const handledTerminalJobs = new Set<string>()
 let eventSource: EventSource | null = null
 let heartbeatTimer: number | undefined
 let heartbeatSeconds = 0
+let trackRequest = 0
+let appliedTrackRequest = 0
+let visibleTrackRequest = 0
+let libraryRefreshPending = false
+let libraryRefreshRunning = false
+let preflightRequest = 0
 let leaving = false
 
 const editingTrack = computed(() => tracks.value.find((track) => String(track.id) === String(editingId.value)) || null)
-const hasOversizedFile = computed(() => selectedFiles.value.some((file) => file.size > MAX_UPLOAD_BYTES))
 const filteredTracks = computed(() => {
   const needle = search.value.trim().toLocaleLowerCase()
   if (!needle) return tracks.value
@@ -97,35 +112,304 @@ const availableCount = computed(() => tracks.value.filter((track) => track.avail
 const visibleUploadJobs = computed(() =>
   uploadQueue.value.jobs.filter((job) => VISIBLE_UPLOADS.has(job.status)),
 )
+const pendingUploadBytes = computed(() =>
+  selectedFiles.value.reduce((total, file) => total + file.size, 0),
+)
+const invalidPendingCount = computed(() =>
+  selectedFiles.value.filter((file) => Boolean(pendingFileIssue(file))).length,
+)
+const filteredPendingFiles = computed(() => {
+  const needle = uploadReviewQuery.value.trim().toLocaleLowerCase()
+  if (!needle) return selectedFiles.value
+  return selectedFiles.value.filter((file) => {
+    const candidates = pendingFileSimilarities(file)
+    return [
+      pendingFilePath(file),
+      file.name,
+      ...candidates.flatMap((candidate) => [
+        candidate.title,
+        candidate.artist,
+        candidate.album,
+        candidate.original_filename,
+      ]),
+    ].some((value) => value?.toLocaleLowerCase().includes(needle))
+  })
+})
+const similarPendingCount = computed(() =>
+  selectedFiles.value.filter((file) => pendingFileSimilarities(file).length > 0).length,
+)
+const unconfirmedSimilarCount = computed(() =>
+  selectedFiles.value.filter((file) => {
+    const key = pendingFileKey(file)
+    return pendingFileSimilarities(file).length > 0 && !confirmedSimilarFiles.value.has(key)
+  }).length,
+)
+const reservableFileCount = computed(() =>
+  queueLoading.value ? 0 : Math.min(selectedFiles.value.length, uploadQueue.value.available_slots),
+)
 
 function clearMessages() {
   error.value = ''
   notice.value = ''
 }
 
-async function load(preserveSelection = true) {
-  loading.value = true
-  error.value = ''
+async function load(preserveSelection = true, background = false) {
+  const requestId = ++trackRequest
+  if (!background) {
+    visibleTrackRequest = requestId
+    loading.value = true
+    error.value = ''
+  }
   try {
-    tracks.value = await api.admin.tracks()
+    const result = await api.admin.tracks()
+    if (requestId < appliedTrackRequest) return
+    appliedTrackRequest = requestId
+    tracks.value = result
     if (preserveSelection && editingId.value !== null) {
       const updated = tracks.value.find((track) => String(track.id) === String(editingId.value))
       if (updated) beginEdit(updated)
       else editingId.value = null
     }
   } catch (cause) {
-    error.value = userFacingError(cause, '无法读取音乐库')
+    if (!background && requestId >= appliedTrackRequest) {
+      error.value = userFacingError(cause, '无法读取音乐库')
+    }
   } finally {
-    loading.value = false
+    if (!background && requestId === visibleTrackRequest) {
+      loading.value = false
+      void runPendingLibraryRefresh()
+    }
+  }
+}
+
+function scheduleLibraryRefresh() {
+  libraryRefreshPending = true
+  void runPendingLibraryRefresh()
+}
+
+async function runPendingLibraryRefresh() {
+  if (libraryRefreshRunning || loading.value || leaving || !libraryRefreshPending) return
+  libraryRefreshPending = false
+  libraryRefreshRunning = true
+  try {
+    await load(false, true)
+  } finally {
+    libraryRefreshRunning = false
+    if (libraryRefreshPending) void runPendingLibraryRefresh()
+  }
+}
+
+function pendingFilePath(file: File): string {
+  return file.webkitRelativePath || file.name
+}
+
+function pendingFileKey(file: File): string {
+  return `${pendingFilePath(file)}\u0000${file.size}\u0000${file.lastModified}`
+}
+
+function pendingFileIssue(file: File): string {
+  if (file.size <= 0) return '空文件，无法上传'
+  if (file.size > MAX_UPLOAD_BYTES) return '超过 500 MiB 上传上限'
+  return ''
+}
+
+function pendingFileSimilarities(file: File): SimilarTrackCandidate[] {
+  return similaritiesByFile.value[pendingFileKey(file)] || []
+}
+
+function candidateSignature(candidates: SimilarTrackCandidate[]): string {
+  return candidates
+    .map((candidate) => [
+      candidate.id,
+      candidate.similarity,
+      candidate.title,
+      candidate.artist,
+      candidate.album,
+      candidate.original_filename,
+    ].join(':'))
+    .join('|')
+}
+
+function isSupportedAudioFile(file: File): boolean {
+  const dot = file.name.lastIndexOf('.')
+  if (dot < 0) return false
+  return AUDIO_EXTENSIONS.has(file.name.slice(dot).toLocaleLowerCase())
+}
+
+function stageFiles(files: File[], source: 'files' | 'directory') {
+  if (!files.length) return
+  clearMessages()
+  uploadReviewError.value = ''
+  const existingKeys = new Set(selectedFiles.value.map(pendingFileKey))
+  const additions: File[] = []
+  let duplicateCount = 0
+  let unsupportedCount = 0
+  let overflowCount = 0
+
+  for (const file of files) {
+    if (!isSupportedAudioFile(file)) {
+      unsupportedCount += 1
+      continue
+    }
+    const key = pendingFileKey(file)
+    if (existingKeys.has(key)) {
+      duplicateCount += 1
+      continue
+    }
+    if (selectedFiles.value.length + additions.length >= MAX_PENDING_FILES) {
+      overflowCount += 1
+      continue
+    }
+    existingKeys.add(key)
+    additions.push(file)
+  }
+
+  if (additions.length) selectedFiles.value = [...selectedFiles.value, ...additions]
+  const messages: string[] = []
+  if (additions.length) {
+    messages.push(
+      source === 'directory'
+        ? `已从本地目录加入 ${additions.length} 个音频文件。`
+        : `已加入 ${additions.length} 个音频文件。`,
+    )
+  }
+  if (unsupportedCount) messages.push(`已忽略 ${unsupportedCount} 个不支持的文件。`)
+  if (duplicateCount) messages.push(`已忽略 ${duplicateCount} 个重复选择。`)
+  if (overflowCount) messages.push(`待上传清单最多保留 ${MAX_PENDING_FILES} 个文件。`)
+  uploadReviewNotice.value = messages.join(' ')
+
+  if (selectedFiles.value.length) {
+    openUploadReview()
+  } else {
+    error.value = source === 'directory'
+      ? '所选目录中没有支持的音频文件。'
+      : '没有加入可上传的音频文件。'
   }
 }
 
 function chooseFiles(event: Event) {
   const input = event.target as HTMLInputElement
-  selectedFiles.value = Array.from(input.files || [])
-  error.value = ''
-  const oversized = selectedFiles.value.find((file) => file.size > MAX_UPLOAD_BYTES)
-  if (oversized) error.value = `${oversized.name} 超过 500 MiB 上传上限。`
+  if (reserving.value) {
+    input.value = ''
+    return
+  }
+  stageFiles(Array.from(input.files || []), 'files')
+  input.value = ''
+}
+
+function chooseDirectory(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (reserving.value) {
+    input.value = ''
+    return
+  }
+  stageFiles(Array.from(input.files || []), 'directory')
+  input.value = ''
+}
+
+function openUploadReview() {
+  if (!selectedFiles.value.length) return
+  if (!uploadReviewOpen.value) uploadReviewQuery.value = ''
+  uploadReviewOpen.value = true
+  void nextTick(() => uploadReviewSearchInput.value?.focus())
+  void preflightPendingFiles()
+}
+
+function closeUploadReview() {
+  if (!reserving.value) uploadReviewOpen.value = false
+}
+
+function clearPendingFiles() {
+  if (reserving.value) return
+  preflightRequest += 1
+  preflighting.value = false
+  selectedFiles.value = []
+  similaritiesByFile.value = {}
+  confirmedSimilarFiles.value = new Set()
+  uploadReviewError.value = ''
+  uploadReviewNotice.value = ''
+  uploadReviewQuery.value = ''
+  if (fileInput.value) fileInput.value.value = ''
+  if (directoryInput.value) directoryInput.value.value = ''
+  uploadReviewOpen.value = false
+}
+
+function removePendingFile(file: File) {
+  if (reserving.value) return
+  const key = pendingFileKey(file)
+  selectedFiles.value = selectedFiles.value.filter((candidate) => candidate !== file)
+  const nextSimilarities = { ...similaritiesByFile.value }
+  delete nextSimilarities[key]
+  similaritiesByFile.value = nextSimilarities
+  const confirmed = new Set(confirmedSimilarFiles.value)
+  confirmed.delete(key)
+  confirmedSimilarFiles.value = confirmed
+  uploadReviewError.value = ''
+  if (!selectedFiles.value.length) clearPendingFiles()
+}
+
+function setSimilarityConfirmation(file: File, confirmed: boolean) {
+  const key = pendingFileKey(file)
+  const next = new Set(confirmedSimilarFiles.value)
+  if (confirmed) next.add(key)
+  else next.delete(key)
+  confirmedSimilarFiles.value = next
+  uploadReviewError.value = ''
+}
+
+function changeSimilarityConfirmation(file: File, event: Event) {
+  setSimilarityConfirmation(file, (event.target as HTMLInputElement).checked)
+}
+
+function updateFileSimilarities(file: File, candidates: SimilarTrackCandidate[]) {
+  const key = pendingFileKey(file)
+  similaritiesByFile.value = {
+    ...similaritiesByFile.value,
+    [key]: candidates,
+  }
+  const confirmed = new Set(confirmedSimilarFiles.value)
+  confirmed.delete(key)
+  confirmedSimilarFiles.value = confirmed
+}
+
+async function preflightPendingFiles(): Promise<boolean> {
+  const files = [...selectedFiles.value]
+  if (!files.length) return true
+  const requestId = ++preflightRequest
+  preflighting.value = true
+  uploadReviewError.value = ''
+  try {
+    const filenames = [...new Set(files.map((file) => file.name))]
+    const result = await api.admin.preflightUploads(filenames)
+    if (requestId !== preflightRequest) return false
+    const byFilename = new Map(
+      result.files.map((checked) => [checked.filename, checked.candidates] as const),
+    )
+    const nextSimilarities: Record<string, SimilarTrackCandidate[]> = {}
+    const nextConfirmed = new Set<string>()
+    for (const file of selectedFiles.value) {
+      const key = pendingFileKey(file)
+      const candidates = byFilename.get(file.name) || []
+      nextSimilarities[key] = candidates
+      if (
+        candidates.length
+        && confirmedSimilarFiles.value.has(key)
+        && candidateSignature(candidates) === candidateSignature(similaritiesByFile.value[key] || [])
+      ) {
+        nextConfirmed.add(key)
+      }
+    }
+    similaritiesByFile.value = nextSimilarities
+    confirmedSimilarFiles.value = nextConfirmed
+    return true
+  } catch (cause) {
+    if (requestId === preflightRequest) {
+      uploadReviewError.value = userFacingError(cause, '无法检查待上传文件的相似曲目')
+    }
+    return false
+  } finally {
+    if (requestId === preflightRequest) preflighting.value = false
+  }
 }
 
 function isOwnedJob(job: UploadJob): boolean {
@@ -179,17 +463,6 @@ function similarTrackCandidates(cause: unknown): SimilarTrackCandidate[] {
   if (!details || typeof details !== 'object') return []
   const candidates = (details as { candidates?: unknown }).candidates
   return Array.isArray(candidates) ? candidates as SimilarTrackCandidate[] : []
-}
-
-function confirmSimilarUpload(file: File, candidates: SimilarTrackCandidate[]): boolean {
-  const matches = candidates.map((candidate) => {
-    const artist = candidate.artist || '未知艺人'
-    const similarity = Math.round(candidate.similarity * 100)
-    return `• ${candidate.title} — ${artist}\n  ${candidate.original_filename} · 相似度 ${similarity}%`
-  }).join('\n')
-  return window.confirm(
-    `“${file.name}”与以下已有曲目名称相似：\n\n${matches}\n\n这可能是不同编码、现场版或重制版。确认仍要上传吗？`,
-  )
 }
 
 function startTransfer(job: UploadJob) {
@@ -258,7 +531,7 @@ function applyUploadSnapshot(snapshot: UploadQueueSnapshot) {
       delete localUploadBytes[job.id]
     }
   }
-  if (refreshLibrary) void load(false)
+  if (refreshLibrary) scheduleLibraryRefresh()
 }
 
 async function refreshUploadQueue() {
@@ -298,42 +571,74 @@ function startHeartbeat(seconds: number) {
 }
 
 async function reserveSelectedFiles() {
-  if (!selectedFiles.value.length || reserving.value || hasOversizedFile.value) return
+  if (!selectedFiles.value.length || reserving.value || preflighting.value) return
+  uploadReviewError.value = ''
+  const preflightComplete = await preflightPendingFiles()
+  if (!preflightComplete) return
+  if (invalidPendingCount.value) {
+    uploadReviewError.value = '请先移除空文件或超过 500 MiB 上限的文件。'
+    return
+  }
+  if (unconfirmedSimilarCount.value) {
+    uploadReviewError.value = `仍有 ${unconfirmedSimilarCount.value} 个相似文件未完成二次确认。`
+    return
+  }
+  if (queueLoading.value || uploadQueue.value.available_slots <= 0) {
+    uploadReviewError.value = '公共上传队列当前没有空位，请稍后重试。'
+    return
+  }
+
+  const filesToReserve = selectedFiles.value.slice(0, uploadQueue.value.available_slots)
   clearMessages()
   reserving.value = true
   const accepted = new Set<File>()
-  const skipped = new Set<File>()
+  let similarityChanged = false
   try {
-    for (const file of selectedFiles.value) {
+    for (const file of filesToReserve) {
       let job: UploadJob
       try {
-        job = await api.admin.reserveUpload(uploadClientId, file)
+        job = await api.admin.reserveUpload(
+          uploadClientId,
+          file,
+          confirmedSimilarFiles.value.has(pendingFileKey(file)),
+        )
       } catch (cause) {
         const candidates = similarTrackCandidates(cause)
         if (!candidates.length) throw cause
-        if (!confirmSimilarUpload(file, candidates)) {
-          skipped.add(file)
-          continue
-        }
-        job = await api.admin.reserveUpload(uploadClientId, file, true)
+        updateFileSimilarities(file, candidates)
+        uploadReviewError.value = `“${file.name}”的相似度检查结果已变化，请重新确认后继续。`
+        similarityChanged = true
+        break
       }
       filesByJob.set(job.id, file)
       accepted.add(file)
     }
-    const summaries: string[] = []
     if (accepted.size) {
-      summaries.push(`已申请 ${accepted.size} 个上传任务；服务器将在并行位置空闲时自动开始传输。`)
+      notice.value = `已申请 ${accepted.size} 个上传任务；服务器将在并行位置空闲时自动开始传输。`
     }
-    if (skipped.size) summaries.push(`已取消 ${skipped.size} 个疑似重复文件。`)
-    notice.value = summaries.join(' ')
+    const remaining = selectedFiles.value.length - accepted.size
+    if (remaining && !similarityChanged) {
+      uploadReviewNotice.value = `本次已提交 ${accepted.size} 个文件，仍有 ${remaining} 个文件保留在待上传清单中。`
+    }
   } catch (cause) {
     const prefix = accepted.size ? `已成功申请 ${accepted.size} 个任务；` : ''
-    error.value = `${prefix}${userFacingError(cause, '无法申请上传队列位置')}`
+    uploadReviewError.value = `${prefix}${userFacingError(cause, '无法申请上传队列位置')}`
   } finally {
-    selectedFiles.value = selectedFiles.value.filter(
-      (file) => !accepted.has(file) && !skipped.has(file),
+    const acceptedKeys = new Set([...accepted].map(pendingFileKey))
+    selectedFiles.value = selectedFiles.value.filter((file) => !accepted.has(file))
+    similaritiesByFile.value = Object.fromEntries(
+      Object.entries(similaritiesByFile.value)
+        .filter(([key]) => !acceptedKeys.has(key)),
     )
-    if (!selectedFiles.value.length && fileInput.value) fileInput.value.value = ''
+    confirmedSimilarFiles.value = new Set(
+      [...confirmedSimilarFiles.value].filter((key) => !acceptedKeys.has(key)),
+    )
+    if (!selectedFiles.value.length) {
+      uploadReviewOpen.value = false
+      uploadReviewQuery.value = ''
+      uploadReviewError.value = ''
+      uploadReviewNotice.value = ''
+    }
     reserving.value = false
     void api.admin.heartbeatUploads(uploadClientId).catch(() => undefined)
     await refreshUploadQueue()
@@ -368,23 +673,6 @@ function expireOwnedUploads() {
     credentials: 'include',
     keepalive: true,
   }).catch(() => undefined)
-}
-
-async function scan() {
-  if (scanning.value || !window.confirm('扫描服务器配置的导入目录？扫描可能需要一段时间，请勿重复提交。')) return
-  clearMessages()
-  scanning.value = true
-  try {
-    const result = await api.admin.scanTracks()
-    await load()
-    const imported = result?.imported ?? result?.tracks?.length ?? 0
-    const skipped = result?.skipped ?? result?.duplicates?.length ?? 0
-    notice.value = `目录扫描完成：导入 ${imported}，跳过 ${skipped}${result?.unavailable !== undefined ? `，标记不可用 ${result.unavailable}` : ''}。`
-  } catch (cause) {
-    error.value = userFacingError(cause, '服务器目录扫描失败')
-  } finally {
-    scanning.value = false
-  }
 }
 
 function beginEdit(track: Track) {
@@ -491,7 +779,7 @@ onBeforeUnmount(() => {
       <div>
         <span class="eyebrow">Media ingest</span>
         <h2>音乐库</h2>
-        <p>上传经过探测的音频文件，或扫描服务器允许的导入目录。</p>
+        <p>从本地选择音频文件或整个目录，确认待上传清单后进入公共队列。</p>
       </div>
       <div class="metric-pair">
         <div><strong>{{ availableCount }}</strong><span>AVAILABLE</span></div>
@@ -507,30 +795,250 @@ onBeforeUnmount(() => {
         <span class="eyebrow" id="ingest-title">Upload bus</span>
         <label class="file-drop" :class="{ populated: selectedFiles.length }" for="track-files">
           <span aria-hidden="true">＋</span>
-          <strong>{{ selectedFiles.length ? `已选择 ${selectedFiles.length} 个文件` : '选择音频文件' }}</strong>
+          <strong>{{ selectedFiles.length ? '继续添加音频文件' : '选择音频文件' }}</strong>
           <small>MP3 / FLAC / M4A / AAC / WAV / OGG · 每个最大 500 MiB</small>
         </label>
-        <input id="track-files" ref="fileInput" class="visually-hidden" type="file" multiple accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*" @change="chooseFiles" />
-        <div v-if="selectedFiles.length" class="file-queue">
-          <span v-for="file in selectedFiles" :key="`${file.name}-${file.lastModified}`">{{ file.name }} <small>{{ formatFileSize(file.size) }}</small></span>
+        <input
+          id="track-files"
+          ref="fileInput"
+          class="visually-hidden"
+          type="file"
+          multiple
+          accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*"
+          :disabled="reserving"
+          @change="chooseFiles"
+        />
+        <div v-if="selectedFiles.length" class="pending-upload-summary">
+          <span><strong>{{ selectedFiles.length }}</strong> 个待上传文件</span>
+          <span>{{ formatFileSize(pendingUploadBytes) }}</span>
+          <span v-if="similarPendingCount" class="pending-upload-summary__warning">{{ similarPendingCount }} 个名称相似</span>
         </div>
         <button
           class="button button--primary"
           type="button"
-          :disabled="reserving || !selectedFiles.length || hasOversizedFile || (!queueLoading && uploadQueue.available_slots === 0)"
-          @click="reserveSelectedFiles"
+          :disabled="reserving || !selectedFiles.length"
+          @click="openUploadReview"
         >
-          {{ reserving ? '正在申请…' : `申请上传队列 · ${uploadQueue.available_slots}/${uploadQueue.queue_limit} 空位` }}
+          管理并确认待上传清单
         </button>
         <small class="ingest-note">名称相似时需二次确认，SHA-256 完全相同会自动驳回。页面保持开启时服务器才会安排传输；关闭页面会取消排队及上传中的任务并清理临时文件。</small>
       </div>
       <div class="ingest-rack__scan">
-        <span class="eyebrow">Server import</span>
-        <strong>扫描受信任目录</strong>
-        <p>服务器会验证音频流、提取标签与封面、以 SHA-256 跳过精确重复；超出推流限制的文件将先规范化为 FLAC。</p>
-        <button class="button button--quiet" type="button" :disabled="scanning" @click="scan">{{ scanning ? '扫描进行中…' : '开始目录扫描' }}</button>
+        <span class="eyebrow">Local directory</span>
+        <strong>扫描本地音频目录</strong>
+        <p>由操作者选择本机目录；浏览器会递归读取其中支持的音频文件，并先加入可编辑的待上传清单，不会立即占用公共队列。</p>
+        <label
+          class="button button--quiet upload-picker-button"
+          :class="{ disabled: reserving }"
+          for="track-directory"
+        >
+          选择本地目录
+        </label>
+        <input
+          id="track-directory"
+          ref="directoryInput"
+          class="visually-hidden"
+          type="file"
+          multiple
+          webkitdirectory
+          accept=".mp3,.flac,.m4a,.aac,.wav,.ogg,audio/*"
+          :disabled="reserving"
+          @change="chooseDirectory"
+        />
       </div>
     </section>
+
+    <Teleport to="body">
+      <div
+        v-if="uploadReviewOpen"
+        class="batch-add-overlay"
+        @pointerdown.self="closeUploadReview"
+        @keydown.esc="closeUploadReview"
+      >
+        <section
+          class="batch-add-tab upload-review-tab"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="upload-review-title"
+          aria-describedby="upload-review-description"
+        >
+          <header class="batch-add-tab__header">
+            <div>
+              <span class="eyebrow">Upload staging</span>
+              <h3 id="upload-review-title">确认待上传清单</h3>
+              <p id="upload-review-description">
+                提交前可移除文件；名称相似项会高亮显示，并要求逐项二次确认。
+              </p>
+            </div>
+            <button
+              class="icon-close"
+              type="button"
+              aria-label="关闭待上传清单"
+              :disabled="reserving"
+              @click="closeUploadReview"
+            >
+              ×
+            </button>
+          </header>
+
+          <div class="batch-add-tab__toolbar">
+            <InlineNotice v-if="uploadReviewError" class="batch-add-tab__notice" tone="danger">
+              {{ uploadReviewError }}
+            </InlineNotice>
+            <InlineNotice v-else-if="uploadReviewNotice" class="batch-add-tab__notice" tone="success">
+              {{ uploadReviewNotice }}
+            </InlineNotice>
+            <div class="field field--search">
+              <label for="upload-review-search">筛选待上传文件</label>
+              <input
+                id="upload-review-search"
+                ref="uploadReviewSearchInput"
+                v-model="uploadReviewQuery"
+                type="search"
+                placeholder="输入文件名、目录或相似曲目信息"
+                autocomplete="off"
+              />
+            </div>
+            <div class="batch-add-tab__selection-tools">
+              <span>
+                {{ selectedFiles.length }} 个文件 · {{ formatFileSize(pendingUploadBytes) }}
+                <template v-if="preflighting"> · 正在检查相似度</template>
+                <template v-if="invalidPendingCount"> · {{ invalidPendingCount }} 个文件不可上传</template>
+                <template v-if="similarPendingCount">
+                  · {{ similarPendingCount }} 个名称相似 / {{ unconfirmedSimilarCount }} 个未确认
+                </template>
+              </span>
+              <label
+                class="button button--quiet button--small upload-picker-button"
+                :class="{ disabled: reserving }"
+                for="track-files"
+              >
+                添加文件
+              </label>
+              <label
+                class="button button--quiet button--small upload-picker-button"
+                :class="{ disabled: reserving }"
+                for="track-directory"
+              >
+                添加目录
+              </label>
+              <button class="text-button" type="button" :disabled="reserving" @click="clearPendingFiles">清空</button>
+            </div>
+          </div>
+
+          <div class="batch-add-tab__list upload-review-list">
+            <article
+              v-for="file in filteredPendingFiles"
+              :key="pendingFileKey(file)"
+              class="upload-review-file"
+              :class="{
+                'upload-review-file--invalid': pendingFileIssue(file),
+                'upload-review-file--similar': pendingFileSimilarities(file).length,
+                'upload-review-file--confirmed': confirmedSimilarFiles.has(pendingFileKey(file)),
+              }"
+            >
+              <div class="upload-review-file__identity">
+                <strong>{{ file.name }}</strong>
+                <small v-if="pendingFilePath(file) !== file.name">{{ pendingFilePath(file) }}</small>
+                <small>{{ formatFileSize(file.size) }}</small>
+              </div>
+              <span v-if="pendingFileIssue(file)" class="upload-review-file__issue">
+                {{ pendingFileIssue(file) }}
+              </span>
+              <span v-else-if="pendingFileSimilarities(file).length" class="upload-review-file__issue">
+                {{
+                  confirmedSimilarFiles.has(pendingFileKey(file))
+                    ? '已完成二次确认'
+                    : '需要二次确认'
+                }}
+              </span>
+              <button
+                class="button button--danger button--small"
+                type="button"
+                :disabled="reserving"
+                :aria-label="`从待上传清单移除 ${file.name}`"
+                @click="removePendingFile(file)"
+              >
+                移除
+              </button>
+
+              <div
+                v-if="pendingFileSimilarities(file).length"
+                class="upload-similarity-review"
+              >
+                <div class="upload-similarity-review__heading">
+                  <strong>检测到 {{ pendingFileSimilarities(file).length }} 条名称相似记录</strong>
+                  <span>这可能是不同编码、现场版或重制版，请核对后继续。</span>
+                </div>
+                <ul>
+                  <li
+                    v-for="candidate in pendingFileSimilarities(file)"
+                    :key="candidate.id"
+                  >
+                    <span>
+                      <strong>{{ candidate.title }} — {{ candidate.artist || '未知艺人' }}</strong>
+                      <small>
+                        {{ candidate.album || '未标注专辑' }} · {{ candidate.original_filename }}
+                      </small>
+                    </span>
+                    <b>{{ Math.round(candidate.similarity * 100) }}%</b>
+                  </li>
+                </ul>
+                <label class="upload-similarity-confirm">
+                  <input
+                    type="checkbox"
+                    :checked="confirmedSimilarFiles.has(pendingFileKey(file))"
+                    :disabled="reserving || preflighting"
+                    @change="changeSimilarityConfirmation(file, $event)"
+                  />
+                  <span>我已核对相似记录，仍确认上传此文件；SHA-256 完全重复仍会自动驳回</span>
+                </label>
+              </div>
+            </article>
+            <div v-if="!filteredPendingFiles.length" class="batch-add-tab__empty">
+              没有匹配的待上传文件。
+            </div>
+          </div>
+
+          <footer class="batch-add-tab__footer">
+            <span v-if="queueLoading">正在读取公共上传队列容量…</span>
+            <span v-else-if="!uploadQueue.available_slots">公共上传队列已满，清单会保留在本页面中。</span>
+            <span v-else-if="selectedFiles.length > reservableFileCount">
+              当前有 {{ uploadQueue.available_slots }} 个空位，本次将提交清单前 {{ reservableFileCount }} 个文件，其余继续保留。
+            </span>
+            <span v-else>
+              当前可申请 {{ uploadQueue.available_slots }}/{{ uploadQueue.queue_limit }} 个公共队列位置。
+            </span>
+            <div>
+              <button class="button button--quiet" type="button" :disabled="reserving" @click="closeUploadReview">
+                稍后处理
+              </button>
+              <button
+                class="button button--primary"
+                type="button"
+                :disabled="
+                  reserving
+                  || preflighting
+                  || queueLoading
+                  || !reservableFileCount
+                  || invalidPendingCount > 0
+                  || unconfirmedSimilarCount > 0
+                "
+                @click="reserveSelectedFiles"
+              >
+                {{
+                  reserving
+                    ? '正在申请…'
+                    : preflighting
+                      ? '正在检查相似度…'
+                      : `确认并申请 ${reservableFileCount} 个队列位置`
+                }}
+              </button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </Teleport>
 
     <section class="upload-queue-panel" aria-labelledby="upload-queue-title">
       <header class="upload-queue-panel__header">

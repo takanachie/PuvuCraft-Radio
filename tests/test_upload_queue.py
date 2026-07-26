@@ -157,6 +157,23 @@ def test_similar_name_requires_confirmation_before_reservation(
             )
         )
 
+    preflight = client.post(
+        "/api/admin/uploads/preflight",
+        headers=csrf_headers(client),
+        json={
+            "filenames": [
+                "Example Artist - Example Song.mp3",
+                "Completely Different Track.mp3",
+            ],
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    checked_files = preflight.json()["files"]
+    assert checked_files[0]["filename"] == "Example Artist - Example Song.mp3"
+    assert checked_files[0]["candidates"][0]["title"] == "Example Song"
+    assert checked_files[1]["candidates"] == []
+    assert client.get("/api/admin/uploads").json()["jobs"] == []
+
     response = client.post(
         "/api/admin/uploads",
         headers=csrf_headers(client),

@@ -116,6 +116,24 @@ class UploadReservationInput(ApiModel):
         return value
 
 
+class UploadPreflightInput(ApiModel):
+    filenames: list[str] = Field(min_length=1, max_length=1000)
+
+    @field_validator("filenames")
+    @classmethod
+    def valid_filenames(cls, values: list[str]) -> list[str]:
+        filenames: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            filename = value.strip()
+            if not filename or len(filename) > 512:
+                raise ValueError("待检查文件名长度必须为 1-512 个字符")
+            if filename not in seen:
+                filenames.append(filename)
+                seen.add(filename)
+        return filenames
+
+
 class UploadHeartbeatInput(ApiModel):
     client_id: str
 

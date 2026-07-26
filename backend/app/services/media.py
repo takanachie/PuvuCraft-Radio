@@ -81,11 +81,46 @@ class MediaService:
         threshold: float = NAME_SIMILARITY_THRESHOLD,
         limit: int = NAME_SIMILARITY_LIMIT,
     ) -> list[dict[str, object]]:
+        tracks = list(db.scalars(select(Track)).all())
+        return self._similar_tracks_from(
+            filename,
+            tracks,
+            threshold=threshold,
+            limit=limit,
+        )
+
+    def similar_tracks_batch(
+        self,
+        db: Session,
+        filenames: list[str],
+        *,
+        threshold: float = NAME_SIMILARITY_THRESHOLD,
+        limit: int = NAME_SIMILARITY_LIMIT,
+    ) -> dict[str, list[dict[str, object]]]:
+        tracks = list(db.scalars(select(Track)).all())
+        return {
+            filename: self._similar_tracks_from(
+                filename,
+                tracks,
+                threshold=threshold,
+                limit=limit,
+            )
+            for filename in filenames
+        }
+
+    def _similar_tracks_from(
+        self,
+        filename: str,
+        tracks: list[Track],
+        *,
+        threshold: float,
+        limit: int,
+    ) -> list[dict[str, object]]:
         requested = self._normalized_name(filename, strip_extension=True)
         if not requested:
             return []
         matches: list[tuple[float, int, dict[str, object]]] = []
-        for track in db.scalars(select(Track)).all():
+        for track in tracks:
             names = {
                 self._normalized_name(track.original_filename, strip_extension=True),
                 self._normalized_name(track.title),

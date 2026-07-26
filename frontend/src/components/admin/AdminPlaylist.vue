@@ -26,7 +26,10 @@ const error = ref('')
 const notice = ref('')
 const dragIndex = ref<number | null>(null)
 let playlistRequest = 0
+let appliedPlaylistRequest = 0
+let visiblePlaylistRequest = 0
 let eventSource: EventSource | null = null
+let playlistRefreshTimer: number | undefined
 
 const currentChannel = computed(() =>
   channels.value.find((channel) => String(channel.id) === selectedChannelId.value) || null,
@@ -75,23 +78,39 @@ function isCurrent(item: PlaylistItem): boolean {
   return Boolean(item.is_current)
 }
 
-async function loadPlaylist() {
+async function loadPlaylist(background = false, reportError = true) {
   const channel = currentChannel.value
   if (!channel) {
     playlist.value = []
-    loading.value = false
+    if (!background) loading.value = false
     return
   }
   const requestId = ++playlistRequest
-  loading.value = true
-  error.value = ''
+  const channelId = String(channel.id)
+  if (!background) {
+    visiblePlaylistRequest = requestId
+    loading.value = true
+    error.value = ''
+  }
   try {
     const result = await api.admin.playlist(channel.id)
-    if (requestId === playlistRequest) playlist.value = result
+    if (
+      requestId >= appliedPlaylistRequest
+      && String(currentChannel.value?.id) === channelId
+    ) {
+      appliedPlaylistRequest = requestId
+      playlist.value = result
+    }
   } catch (cause) {
-    if (requestId === playlistRequest) error.value = userFacingError(cause, '无法读取频道播放列表')
+    if (
+      reportError
+      && requestId >= appliedPlaylistRequest
+      && String(currentChannel.value?.id) === channelId
+    ) {
+      error.value = userFacingError(cause, '无法读取频道播放列表')
+    }
   } finally {
-    if (requestId === playlistRequest) loading.value = false
+    if (!background && requestId === visiblePlaylistRequest) loading.value = false
   }
 }
 
@@ -110,7 +129,7 @@ async function loadInitial() {
   }
 }
 
-async function refreshContext() {
+async function refreshContext(background = false) {
   const selected = selectedChannelId.value
   const [channelList, trackList] = await Promise.all([api.admin.channels(), api.admin.tracks()])
   channels.value = channelList.sort((a, b) => (a.display_order ?? 0) - (b.display_order ?? 0))
@@ -118,13 +137,27 @@ async function refreshContext() {
   if (!channels.value.some((item) => String(item.id) === selected) && channels.value[0]) {
     selectedChannelId.value = String(channels.value[0].id)
   } else {
-    await loadPlaylist()
+    await loadPlaylist(background)
   }
 }
 
 function closeEvents() {
   eventSource?.close()
   eventSource = null
+}
+
+function schedulePlaylistRefresh() {
+  if (playlistRefreshTimer !== undefined) window.clearTimeout(playlistRefreshTimer)
+  playlistRefreshTimer = window.setTimeout(() => {
+    playlistRefreshTimer = undefined
+    void loadPlaylist(true, false)
+  }, 75)
+}
+
+function cancelPlaylistRefresh() {
+  if (playlistRefreshTimer === undefined) return
+  window.clearTimeout(playlistRefreshTimer)
+  playlistRefreshTimer = undefined
 }
 
 function handlePlaybackEvent(message: MessageEvent<string>) {
@@ -136,7 +169,7 @@ function handlePlaybackEvent(message: MessageEvent<string>) {
   }
   const type = (event.type || event.event || message.type || '').toLowerCase()
   if (type.includes('playlist')) {
-    void loadPlaylist()
+    schedulePlaylistRefresh()
     return
   }
   const selected = currentChannel.value
@@ -289,7 +322,7 @@ async function addTrack() {
   try {
     await api.admin.addPlaylistItem(channel.id, track.id)
     resetAddTrackSelection()
-    await loadPlaylist()
+    await loadPlaylist(true)
     notice.value = `已将“${track.title}”加入播放列表。`
   } catch (cause) {
     error.value = userFacingError(cause, '曲目添加失败')
@@ -312,7 +345,7 @@ async function addTracksBatch() {
       selectedTracks.map((track) => track.id),
     )
     resetBatchAdd()
-    await loadPlaylist()
+    await loadPlaylist(true)
     notice.value = added.length
       ? `已批量将 ${added.length} 首曲目加入播放列表。`
       : '所选曲目均已存在于播放列表中。'
@@ -384,7 +417,7 @@ async function remove(item: PlaylistItem) {
   busy.value = true
   try {
     await api.admin.removePlaylistItem(channel.id, itemId(item))
-    await refreshContext()
+    await refreshContext(true)
     notice.value = '曲目已从播放列表移除。'
   } catch (cause) {
     error.value = userFacingError(cause, '无法移除播放列表项目')
@@ -416,7 +449,7 @@ async function skip() {
   busy.value = true
   try {
     await api.admin.skip(channel.id)
-    await refreshContext()
+    await refreshContext(true)
     notice.value = '跳过命令已发送，频道正在同步切换。'
   } catch (cause) {
     error.value = userFacingError(cause, '跳过命令失败')
@@ -434,7 +467,7 @@ async function playNow(item: PlaylistItem) {
   busy.value = true
   try {
     await api.admin.playNow(channel.id, itemId(item))
-    await refreshContext()
+    await refreshContext(true)
     notice.value = '立即播放命令已发送，频道正在建立新时间线。'
   } catch (cause) {
     error.value = userFacingError(cause, '立即播放命令失败')
@@ -444,6 +477,7 @@ async function playNow(item: PlaylistItem) {
 }
 
 watch(selectedChannelId, () => {
+  cancelPlaylistRefresh()
   resetAddTrackSelection()
   resetBatchAdd()
   const channel = currentChannel.value
@@ -477,7 +511,10 @@ watch(filteredAddableTracks, (items) => {
 })
 
 onMounted(() => void loadInitial())
-onBeforeUnmount(closeEvents)
+onBeforeUnmount(() => {
+  cancelPlaylistRefresh()
+  closeEvents()
+})
 </script>
 
 <template>
@@ -681,7 +718,7 @@ onBeforeUnmount(closeEvents)
       <span>{{ playlist.length }} ITEMS</span>
       <span>TOTAL {{ formatDuration(totalDuration) }}</span>
       <span>拖放或使用上下按钮排序</span>
-      <button class="text-button" type="button" :disabled="loading || busy" @click="loadPlaylist">刷新</button>
+      <button class="text-button" type="button" :disabled="loading || busy" @click="loadPlaylist()">刷新</button>
     </div>
 
     <ol class="admin-playlist" :aria-busy="loading || busy">

@@ -25,7 +25,7 @@ function savedVolume(): number {
 export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
   const state = ref<AudioTransportState>('idle')
   const isPlaying = ref(false)
-  const wantsPlayback = ref(false)
+  const isReceiving = ref(false)
   const autoplayBlocked = ref(false)
   const muted = ref(false)
   const volume = ref(savedVolume())
@@ -58,14 +58,33 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
 
   async function attemptPlay() {
     const audio = audioElement.value
-    if (!audio || !currentUrl || !wantsPlayback.value) return
+    if (!audio || !currentUrl || !isReceiving.value) return
+    const generation = sourceGeneration
     try {
       await audio.play()
+      if (
+        generation !== sourceGeneration
+        || audio !== audioElement.value
+        || !isReceiving.value
+      ) return
       autoplayBlocked.value = false
       error.value = ''
     } catch (cause) {
+      if (
+        generation !== sourceGeneration
+        || audio !== audioElement.value
+        || !isReceiving.value
+      ) return
       if (cause instanceof DOMException && cause.name === 'NotAllowedError') {
+        isReceiving.value = false
         autoplayBlocked.value = true
+        clearRetry()
+        audio.pause()
+        if (hls) hls.stopLoad()
+        else {
+          audio.removeAttribute('src')
+          audio.load()
+        }
         state.value = 'blocked'
         return
       }
@@ -77,7 +96,7 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
   }
 
   function scheduleReload() {
-    if (!wantsPlayback.value || !currentUrl || retryTimer) return
+    if (!isReceiving.value || !currentUrl || retryTimer) return
     state.value = 'reconnecting'
     const delay = Math.min(8000, 750 * 2 ** retryCount)
     retryCount += 1
@@ -89,7 +108,7 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
 
   async function loadSource() {
     const audio = audioElement.value
-    if (!audio || !currentUrl) return
+    if (!audio || !currentUrl || !isReceiving.value) return
 
     const generation = ++sourceGeneration
     destroyEngine(false, false)
@@ -100,7 +119,7 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
     if (nativeHls) {
       audio.src = currentUrl
       audio.load()
-      if (wantsPlayback.value) void attemptPlay()
+      void attemptPlay()
       return
     }
 
@@ -121,7 +140,8 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
       return
     }
 
-    hls = new HlsClass({
+    const engine = new HlsClass({
+      autoStartLoad: false,
       enableWorker: true,
       lowLatencyMode: false,
       liveSyncDurationCount: 2,
@@ -131,27 +151,43 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
         xhr.withCredentials = true
       },
     })
-    hls.attachMedia(audio)
-    hls.on(HlsClass.Events.MEDIA_ATTACHED, () => hls?.loadSource(currentUrl))
-    hls.on(HlsClass.Events.MANIFEST_PARSED, () => {
-      retryCount = 0
-      state.value = 'ready'
-      if (wantsPlayback.value) void attemptPlay()
+    hls = engine
+    engine.attachMedia(audio)
+    engine.on(HlsClass.Events.MEDIA_ATTACHED, () => {
+      if (
+        generation === sourceGeneration
+        && hls === engine
+        && isReceiving.value
+      ) engine.loadSource(currentUrl)
     })
-    hls.on(HlsClass.Events.ERROR, (_event, data) => {
+    engine.on(HlsClass.Events.MANIFEST_PARSED, () => {
+      if (generation !== sourceGeneration || hls !== engine) return
+      retryCount = 0
+      if (!isReceiving.value) {
+        engine.stopLoad()
+        state.value = autoplayBlocked.value ? 'blocked' : 'paused'
+        return
+      }
+      engine.startLoad(-1)
+      state.value = 'ready'
+      void attemptPlay()
+    })
+    engine.on(HlsClass.Events.ERROR, (_event, data) => {
+      if (generation !== sourceGeneration || hls !== engine) return
+      if (!isReceiving.value) return
       if (!data.fatal) return
       const responseCode = 'response' in data ? data.response?.code : undefined
       if (responseCode === 401) {
-        wantsPlayback.value = false
+        isReceiving.value = false
         state.value = 'error'
         error.value = '登录会话已失效，请重新登录'
-        hls?.stopLoad()
+        engine.stopLoad()
         window.dispatchEvent(new CustomEvent('radio:unauthorized'))
         return
       }
-      if (data.type === HlsClass.ErrorTypes.MEDIA_ERROR && hls) {
+      if (data.type === HlsClass.ErrorTypes.MEDIA_ERROR) {
         state.value = 'buffering'
-        hls.recoverMediaError()
+        engine.recoverMediaError()
         return
       }
       error.value = data.type === HlsClass.ErrorTypes.NETWORK_ERROR
@@ -161,33 +197,40 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
     })
   }
 
-  function connect(url: string, autoplay = false) {
+  function connect(url: string, receive = false) {
     currentUrl = url
-    wantsPlayback.value = autoplay
+    isReceiving.value = receive
     autoplayBlocked.value = false
     retryCount = 0
-    void loadSource()
+    if (receive) {
+      void loadSource()
+    } else {
+      destroyEngine()
+      isPlaying.value = false
+      state.value = 'paused'
+    }
   }
 
   function disconnect() {
-    wantsPlayback.value = false
+    isReceiving.value = false
     currentUrl = ''
     destroyEngine()
     isPlaying.value = false
     state.value = 'idle'
   }
 
-  function resumeLive() {
+  function continueReception() {
     if (!currentUrl) return
-    wantsPlayback.value = true
+    isReceiving.value = true
     autoplayBlocked.value = false
     error.value = ''
+    retryCount = 0
+    clearRetry()
 
     const audio = audioElement.value
     if (hls && audio) {
       state.value = 'connecting'
-      hls.stopLoad()
-      hls.loadSource(currentUrl)
+      if (!hls.url) hls.loadSource(currentUrl)
       hls.startLoad(-1)
       void attemptPlay()
       return
@@ -196,22 +239,25 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
     void loadSource()
   }
 
-  function pause() {
-    wantsPlayback.value = false
+  function pauseReception() {
+    if (!currentUrl) return
+    isReceiving.value = false
     autoplayBlocked.value = false
     clearRetry()
     audioElement.value?.pause()
     if (hls) hls.stopLoad()
     else if (audioElement.value) {
+      sourceGeneration += 1
       audioElement.value.removeAttribute('src')
       audioElement.value.load()
     }
+    isPlaying.value = false
     state.value = 'paused'
   }
 
-  function togglePlayback() {
-    if (isPlaying.value || (wantsPlayback.value && !autoplayBlocked.value)) pause()
-    else resumeLive()
+  function toggleReception() {
+    if (isReceiving.value) pauseReception()
+    else continueReception()
   }
 
   function toggleMute() {
@@ -231,6 +277,10 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
   }
 
   function handlePlaying() {
+    if (!isReceiving.value) {
+      audioElement.value?.pause()
+      return
+    }
     isPlaying.value = true
     retryCount = 0
     state.value = 'playing'
@@ -239,20 +289,21 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
 
   function handlePause() {
     isPlaying.value = false
-    if (!wantsPlayback.value) state.value = 'paused'
+    if (!isReceiving.value && !autoplayBlocked.value) state.value = 'paused'
   }
 
   function handleWaiting() {
-    if (wantsPlayback.value) state.value = 'buffering'
+    if (isReceiving.value) state.value = 'buffering'
   }
 
   function handleCanPlay() {
+    if (!isReceiving.value) return
     if (state.value !== 'playing') state.value = 'ready'
-    if (wantsPlayback.value) void attemptPlay()
+    void attemptPlay()
   }
 
   function handleError() {
-    if (wantsPlayback.value) scheduleReload()
+    if (isReceiving.value) scheduleReload()
   }
 
   function bind(audio: HTMLAudioElement) {
@@ -264,7 +315,7 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
     audio.addEventListener('stalled', handleWaiting)
     audio.addEventListener('canplay', handleCanPlay)
     audio.addEventListener('error', handleError)
-    if (currentUrl) void loadSource()
+    if (currentUrl && isReceiving.value) void loadSource()
   }
 
   function unbind(audio: HTMLAudioElement) {
@@ -277,11 +328,11 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
   }
 
   function handleOnline() {
-    if (wantsPlayback.value && currentUrl) void loadSource()
+    if (isReceiving.value && currentUrl) void loadSource()
   }
 
   function handleOffline() {
-    if (wantsPlayback.value) state.value = 'reconnecting'
+    if (isReceiving.value) state.value = 'reconnecting'
   }
 
   watch(audioElement, (next, previous) => {
@@ -306,16 +357,16 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
   return {
     state,
     isPlaying,
-    wantsPlayback,
+    isReceiving,
     autoplayBlocked,
     muted,
     volume,
     error,
     connect,
     disconnect,
-    resumeLive,
-    pause,
-    togglePlayback,
+    continueReception,
+    pauseReception,
+    toggleReception,
     toggleMute,
     setVolume,
   }

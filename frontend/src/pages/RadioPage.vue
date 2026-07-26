@@ -3,13 +3,13 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { userFacingError } from '../api/client'
-import type { Channel, PlaybackState, PlaylistItem, TrackSummary } from '../api/types'
+import type { Channel, PlaybackState, TrackSummary } from '../api/types'
 import ConsoleHeader from '../components/ConsoleHeader.vue'
 import InlineNotice from '../components/InlineNotice.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { useLiveAudio } from '../composables/useLiveAudio'
 import { session } from '../session'
-import { formatDuration, itemId, trackFromItem } from '../utils/format'
+import { formatDuration } from '../utils/format'
 import { interpolatedPosition, parsePlaybackEvent, playbackFromEvent, playbackPercent } from '../utils/playback'
 
 const route = useRoute()
@@ -20,9 +20,7 @@ const player = useLiveAudio(audio)
 const channels = ref<Channel[]>([])
 const selectedId = ref('')
 const channel = ref<Channel | null>(null)
-const playlist = ref<PlaylistItem[]>([])
 const loading = ref(true)
-const playlistLoading = ref(false)
 const pageError = ref('')
 const eventsState = ref<'connecting' | 'connected' | 'reconnecting'>('connecting')
 const playback = ref<PlaybackState>({ status: 'starting', position_seconds: 0 })
@@ -32,7 +30,6 @@ const clock = ref(Date.now())
 let eventSource: EventSource | null = null
 let clockTimer: ReturnType<typeof setInterval> | null = null
 let loadSequence = 0
-let playlistSequence = 0
 let hasConnected = false
 let lastSessionCheck = 0
 
@@ -48,23 +45,18 @@ const currentTrack = computed<TrackSummary | null>(() =>
 const duration = computed(() => playback.value.duration_seconds ?? currentTrack.value?.duration_seconds ?? null)
 const serverPosition = computed(() => interpolatedPosition({ state: playback.value, receivedAt: receivedAt.value }, clock.value))
 const progress = computed(() => playbackPercent(serverPosition.value, duration.value))
-const currentItemId = computed(() => playback.value.current_item_id)
-const transportActive = computed(() =>
-  player.isPlaying.value || (player.wantsPlayback.value && !player.autoplayBlocked.value),
-)
-
 const transportLabel = computed(() => {
   const labels: Record<string, string> = {
-    idle: '未连接',
-    connecting: '正在调谐',
+    idle: '未接收',
+    connecting: '正在建立接收',
     ready: '信号就绪',
     playing: '正在收听',
-    paused: '本地已暂停',
-    buffering: '正在缓冲',
-    reconnecting: '信号重连中',
-    blocked: '等待开始',
+    paused: '已暂停接收',
+    buffering: '接收缓冲中',
+    reconnecting: '接收重连中',
+    blocked: '等待继续接收',
     unsupported: '浏览器不支持',
-    error: '播放错误',
+    error: '接收错误',
   }
   return labels[player.state.value] || player.state.value
 })
@@ -78,33 +70,13 @@ function closeEvents() {
   eventSource = null
 }
 
-async function refreshPlaylist(channelId: Channel['id']) {
-  const requestId = ++playlistSequence
-  playlistLoading.value = true
-  try {
-    const result = await api.channels.playlist(channelId)
-    if (requestId === playlistSequence && String(channel.value?.id) === String(channelId)) {
-      playlist.value = result
-    }
-  } catch (cause) {
-    if (requestId === playlistSequence && String(channel.value?.id) === String(channelId)) {
-      pageError.value = userFacingError(cause, '无法读取频道歌单')
-    }
-  } finally {
-    if (requestId === playlistSequence) playlistLoading.value = false
-  }
-}
-
 function handleEvent(message: MessageEvent<string>) {
   const event = parsePlaybackEvent(message.data)
   if (!event) return
 
   const type = (event.type || event.event || message.type || '').toLowerCase()
   if (type === 'heartbeat' || type === 'ping') return
-  if (type.includes('playlist')) {
-    if (channel.value) void refreshPlaylist(channel.value.id)
-    return
-  }
+  if (type.includes('playlist')) return
 
   const next = playbackFromEvent(event, playback.value)
   playback.value = next.playback
@@ -118,13 +90,15 @@ function handleEvent(message: MessageEvent<string>) {
       String(item.id) === String(channel.value?.id) ? { ...item, ...event.channel } : item,
     )
     if (event.channel.enabled === false) {
+      const shouldResume = player.isReceiving.value
       player.disconnect()
+      if (shouldResume) hasConnected = false
       void loadChannels()
       return
     }
     if (event.channel.slug && event.channel.slug !== previousSlug) {
-      const shouldPlay = player.wantsPlayback.value || player.isPlaying.value
-      player.connect(hlsUrl(event.channel.slug), shouldPlay)
+      const shouldReceive = player.isReceiving.value
+      player.connect(hlsUrl(event.channel.slug), shouldReceive)
       void router.replace({ query: { ...route.query, channel: event.channel.slug } })
     }
   }
@@ -148,7 +122,7 @@ function openEvents(channelId: Channel['id']) {
     }
   }
   eventSource.onmessage = handleEvent
-  for (const name of ['playback', 'state', 'track', 'status', 'playlist', 'channel']) {
+  for (const name of ['playback', 'state', 'track', 'status', 'channel']) {
     eventSource.addEventListener(name, handleEvent as EventListener)
   }
 }
@@ -157,28 +131,17 @@ async function loadChannel(channelId: string) {
   const target = channels.value.find((item) => String(item.id) === channelId)
   if (!target) return
   const sequence = ++loadSequence
-  playlistSequence += 1
-  const shouldPlay = !hasConnected || player.wantsPlayback.value || player.isPlaying.value
+  const shouldReceive = !hasConnected || player.isReceiving.value
   pageError.value = ''
   loading.value = true
   closeEvents()
   player.disconnect()
 
   try {
-    const [detailResult, playlistResult] = await Promise.allSettled([
-      api.channels.get(target.id),
-      api.channels.playlist(target.id),
-    ])
+    const detail = await api.channels.get(target.id)
     if (sequence !== loadSequence) return
-    if (detailResult.status === 'rejected') throw detailResult.reason
 
-    const detail = detailResult.value
     channel.value = detail
-    if (playlistResult.status === 'fulfilled') playlist.value = playlistResult.value
-    else {
-      playlist.value = []
-      pageError.value = userFacingError(playlistResult.reason, '直播已连接，但播放列表暂时无法读取')
-    }
     const initialPlayback = detail.playback_state ?? detail.playback
     playback.value = initialPlayback
       ? { ...initialPlayback, status: initialPlayback.status || detail.status || 'starting' }
@@ -191,17 +154,16 @@ async function loadChannel(channelId: string) {
     openEvents(detail.id)
 
     hasConnected = true
-    player.connect(hlsUrl(detail.slug), shouldPlay)
+    player.connect(hlsUrl(detail.slug), shouldReceive)
     void router.replace({ query: { ...route.query, channel: detail.slug } })
   } catch (cause) {
     if (sequence !== loadSequence) return
     pageError.value = userFacingError(cause, '频道暂时无法连接')
-    if (shouldPlay) hasConnected = false
+    if (shouldReceive) hasConnected = false
     player.disconnect()
   } finally {
     if (sequence === loadSequence) {
       loading.value = false
-      playlistLoading.value = false
     }
   }
 }
@@ -225,13 +187,6 @@ async function loadChannels() {
     pageError.value = userFacingError(cause, '无法读取可用频道')
     loading.value = false
   }
-}
-
-function isCurrent(item: PlaylistItem): boolean {
-  if (currentItemId.value !== null && currentItemId.value !== undefined) {
-    return String(itemId(item)) === String(currentItemId.value)
-  }
-  return Boolean(item.is_current)
 }
 
 function changeVolume(event: Event) {
@@ -337,19 +292,20 @@ onBeforeUnmount(() => {
             <div v-if="player.error.value" class="readout-error" role="status">{{ player.error.value }}</div>
           </div>
 
-          <div class="transport-deck" aria-label="本地播放控制">
+          <div class="transport-deck" aria-label="直播接收控制">
             <div class="transport-deck__state">
-              <span class="status-lamp" :class="{ 'status-lamp--active': player.isPlaying.value }" aria-hidden="true"></span>
+              <span class="status-lamp" :class="{ 'status-lamp--active': player.isReceiving.value }" aria-hidden="true"></span>
               <span>{{ transportLabel }}</span>
             </div>
             <button
               class="transport-button transport-button--play"
               type="button"
-              :aria-label="transportActive ? '暂停本地播放' : '从直播点开始播放'"
-              @click="player.togglePlayback"
+              :aria-label="player.isReceiving.value ? '暂停接收直播流' : '继续接收直播流'"
+              :disabled="loading || !selectedChannel || player.state.value === 'idle'"
+              @click="player.toggleReception"
             >
-              <span aria-hidden="true">{{ transportActive ? 'Ⅱ' : '▶' }}</span>
-              {{ transportActive ? '暂停' : '播放' }}
+              <span aria-hidden="true">{{ player.isReceiving.value ? 'Ⅱ' : '▶' }}</span>
+              {{ player.isReceiving.value ? '暂停接收' : '继续接收' }}
             </button>
             <button
               class="transport-button"
@@ -380,39 +336,12 @@ onBeforeUnmount(() => {
             <span class="autoplay-gate__pulse" aria-hidden="true"></span>
             <div>
               <strong id="autoplay-title">浏览器正在等待你的操作</strong>
-              <p id="autoplay-copy">自动播放已被阻止。点击后将从频道当前直播点开始，而不是从缓存位置继续。</p>
+              <p id="autoplay-copy">自动接收已被阻止。点击后将从频道当前直播点继续接收，而不是从缓存位置继续。</p>
             </div>
-            <button class="button button--primary" type="button" @click="player.resumeLive">开始收听直播</button>
+            <button class="button button--primary" type="button" @click="player.continueReception">
+              继续接收直播
+            </button>
           </div>
-        </section>
-
-        <section class="playlist-console" aria-labelledby="playlist-title">
-          <header class="section-header">
-            <div>
-              <span class="eyebrow">Program memory</span>
-              <h2 id="playlist-title">完整播放列表</h2>
-            </div>
-            <div class="section-header__meta">
-              <span>{{ playlist.length }} TRACKS</span>
-              <span>{{ selectedChannel?.playback_mode === 'shuffle' ? 'SHUFFLE' : 'SEQUENTIAL' }}</span>
-            </div>
-          </header>
-
-          <div v-if="playlistLoading" class="loading-line" role="status">正在读取播放列表…</div>
-          <ol v-else-if="playlist.length" class="listener-playlist">
-            <li v-for="(item, index) in playlist" :key="itemId(item)" :class="{ current: isCurrent(item), unavailable: trackFromItem(item).available === false }">
-              <span class="playlist-position">{{ String(index + 1).padStart(2, '0') }}</span>
-              <span v-if="isCurrent(item)" class="playing-bars" aria-label="正在播放"><i></i><i></i><i></i></span>
-              <span v-else class="playlist-dot" aria-hidden="true"></span>
-              <span class="playlist-track">
-                <strong>{{ trackFromItem(item).title }}</strong>
-                <small>{{ trackFromItem(item).artist || '未知艺人' }}<template v-if="trackFromItem(item).album"> / {{ trackFromItem(item).album }}</template></small>
-              </span>
-              <span v-if="trackFromItem(item).available === false" class="playlist-unavailable">不可用</span>
-              <time>{{ formatDuration(trackFromItem(item).duration_seconds) }}</time>
-            </li>
-          </ol>
-          <div v-else class="playlist-empty">该频道的播放列表为空，直播暂时无法启动。</div>
         </section>
       </template>
     </main>

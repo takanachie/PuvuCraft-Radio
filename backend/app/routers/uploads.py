@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from ..dependencies import require_admin, require_admin_read
 from ..errors import ApiError
 from ..models import User, utcnow
-from ..schemas import UploadHeartbeatInput, UploadReservationInput
+from ..schemas import UploadHeartbeatInput, UploadPreflightInput, UploadReservationInput
 from ..serializers import iso
 
 router = APIRouter(prefix="/api/admin/uploads")
@@ -45,6 +45,15 @@ def reserve_upload(
             confirm_similar=payload.confirm_similar,
         )
     }
+
+
+@router.post("/preflight")
+def preflight_uploads(
+    payload: UploadPreflightInput,
+    request: Request,
+    _admin: User = Depends(require_admin),
+) -> dict[str, object]:
+    return _manager(request).preflight(payload.filenames)
 
 
 @router.post("/heartbeat", status_code=204)

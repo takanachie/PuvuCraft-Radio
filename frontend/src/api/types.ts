@@ -184,15 +184,6 @@ export interface TrackInput {
   cover_url?: string | null
 }
 
-export interface UploadResponse {
-  tracks?: Track[]
-  track?: Track
-  duplicates?: Track[]
-  skipped?: number
-  imported?: number
-  message?: string
-}
-
 export interface SimilarTrackCandidate {
   id: EntityId
   title: string
@@ -201,6 +192,15 @@ export interface SimilarTrackCandidate {
   original_filename: string
   duration_seconds: number
   similarity: number
+}
+
+export interface UploadPreflightFile {
+  filename: string
+  candidates: SimilarTrackCandidate[]
+}
+
+export interface UploadPreflightResponse {
+  files: UploadPreflightFile[]
 }
 
 export interface UploadJob {
@@ -237,11 +237,6 @@ export interface UploadQueueSnapshot {
   active_count: number
   available_slots: number
   heartbeat_interval_seconds: number
-}
-
-export interface ScanResponse extends UploadResponse {
-  unavailable?: number
-  examined?: number
 }
 
 export interface MessageResponse {

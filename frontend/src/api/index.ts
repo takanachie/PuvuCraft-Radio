@@ -7,12 +7,12 @@ import type {
   PlaylistItem,
   RegistrationPayload,
   RegistrationResponse,
-  ScanResponse,
   SetupPayload,
   SetupStatus,
   Track,
   TrackInput,
   UploadJob,
+  UploadPreflightResponse,
   UploadQueueSnapshot,
   User,
   UserStatus,
@@ -114,6 +114,12 @@ export const api = {
     async uploadQueue(): Promise<UploadQueueSnapshot> {
       return request<UploadQueueSnapshot>('/api/admin/uploads')
     },
+    async preflightUploads(filenames: string[]): Promise<UploadPreflightResponse> {
+      return request<UploadPreflightResponse>('/api/admin/uploads/preflight', {
+        method: 'POST',
+        json: { filenames },
+      })
+    },
     async reserveUpload(
       clientId: string,
       file: File,
@@ -140,13 +146,6 @@ export const api = {
       await request(`/api/admin/uploads/${encodeURIComponent(jobId)}`, {
         method: 'DELETE',
       })
-    },
-    async scanTracks(): Promise<ScanResponse | undefined> {
-      const payload = await request<unknown>('/api/admin/tracks/scan', {
-        method: 'POST',
-        json: {},
-      })
-      return unwrapEntity<ScanResponse | undefined>(payload)
     },
     async updateTrack(trackId: EntityId, input: Partial<TrackInput>): Promise<Track | undefined> {
       const payload = await request<unknown>(`/api/admin/tracks/${id(trackId)}`, {
