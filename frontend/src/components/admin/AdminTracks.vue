@@ -17,6 +17,14 @@ import StatusBadge from '../StatusBadge.vue'
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 const CLIENT_BOUND_UPLOADS = new Set<UploadJobStatus>(['queued', 'ready', 'uploading'])
+const VISIBLE_UPLOADS = new Set<UploadJobStatus>([
+  'queued',
+  'ready',
+  'uploading',
+  'verifying',
+  'normalizing',
+  'placing',
+])
 const TERMINAL_UPLOADS = new Set<UploadJobStatus>([
   'completed',
   'failed',
@@ -86,6 +94,9 @@ const filteredTracks = computed(() => {
   )
 })
 const availableCount = computed(() => tracks.value.filter((track) => track.available !== false).length)
+const visibleUploadJobs = computed(() =>
+  uploadQueue.value.jobs.filter((job) => VISIBLE_UPLOADS.has(job.status)),
+)
 
 function clearMessages() {
   error.value = ''
@@ -538,9 +549,9 @@ onBeforeUnmount(() => {
           <thead><tr><th>文件</th><th>申请人</th><th>进度</th><th>阶段</th><th>存储</th><th class="align-right">操作</th></tr></thead>
           <tbody>
             <tr v-if="queueLoading"><td colspan="6" class="table-message">正在连接公共上传队列…</td></tr>
-            <tr v-else-if="!uploadQueue.jobs.length"><td colspan="6" class="table-message">上传队列为空。</td></tr>
+            <tr v-else-if="!visibleUploadJobs.length"><td colspan="6" class="table-message">上传队列为空。</td></tr>
             <template v-else>
-              <tr v-for="job in uploadQueue.jobs" :key="job.id">
+              <tr v-for="job in visibleUploadJobs" :key="job.id">
                 <td data-label="文件">
                   <strong>{{ job.original_filename }}</strong>
                   <small>{{ formatFileSize(job.declared_size_bytes) }} · {{ job.id.slice(0, 8) }}</small>
