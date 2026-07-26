@@ -50,6 +50,10 @@ class UserUpdate(ApiModel):
     status: Literal["pending", "approved", "rejected", "disabled"]
 
 
+class UserRoleUpdate(ApiModel):
+    role: Literal["admin"]
+
+
 class ChannelCreate(ApiModel):
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(min_length=1, max_length=80)

@@ -79,6 +79,16 @@ export const api = {
       })
       return unwrapEntity<User | undefined>(payload, ['user'])
     },
+    async promoteUser(userId: EntityId): Promise<User | undefined> {
+      const payload = await request<unknown>(`/api/admin/users/${id(userId)}/role`, {
+        method: 'PATCH',
+        json: { role: 'admin' },
+      })
+      return unwrapEntity<User | undefined>(payload, ['user'])
+    },
+    async deleteUser(userId: EntityId): Promise<void> {
+      await request(`/api/admin/users/${id(userId)}`, { method: 'DELETE' })
+    },
 
     async channels(): Promise<Channel[]> {
       return unwrapList<Channel>(await request<unknown>('/api/admin/channels'), ['channels'])

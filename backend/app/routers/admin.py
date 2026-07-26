@@ -20,6 +20,7 @@ from ..models import (
     PlaybackState,
     PlaylistItem,
     Track,
+    UploadJob,
     User,
     utcnow,
 )
@@ -30,12 +31,14 @@ from ..schemas import (
     PlaylistItemUpdate,
     PlaylistReorder,
     TrackUpdate,
+    UserRoleUpdate,
     UserUpdate,
 )
 from ..security import AuthService
 from ..serializers import channel_dict, playlist_item_dict, track_dict, user_dict
 from ..services.playback import ChannelCommand
 from ..services.storage import StorageUnavailable
+from ..services.uploads import CAPACITY_STATUSES
 
 router = APIRouter(prefix="/api/admin")
 logger = logging.getLogger(__name__)
@@ -115,6 +118,90 @@ def update_user(
     db.commit()
     db.refresh(user)
     return {"user": user_dict(user)}
+
+
+@router.patch("/users/{user_id}/role")
+def update_user_role(
+    user_id: int,
+    payload: UserRoleUpdate,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    user = db.get(User, user_id)
+    if user is None:
+        raise ApiError(404, "user_not_found", "用户不存在")
+    if user.role == payload.role:
+        return {"user": user_dict(user)}
+    if user.role != "listener":
+        raise ApiError(409, "invalid_role_transition", "当前用户角色不能执行该提权操作")
+    if user.status != "approved":
+        raise ApiError(409, "user_not_approved", "请先批准并启用该用户，再授予管理员权限")
+
+    previous = user.role
+    user.role = payload.role
+    user.updated_at = utcnow()
+    auth: AuthService = request.app.state.auth
+    auth.revoke_user_sessions(db, user.id)
+    audit(
+        db,
+        admin,
+        "user.role_changed",
+        "user",
+        user.id,
+        {"from": previous, "to": payload.role},
+    )
+    db.commit()
+    db.refresh(user)
+    return {"user": user_dict(user)}
+
+
+@router.delete("/users/{user_id}", status_code=204)
+def delete_user(
+    user_id: int,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> None:
+    user = db.get(User, user_id)
+    if user is None:
+        raise ApiError(404, "user_not_found", "用户不存在")
+    if user.id == admin.id:
+        raise ApiError(409, "cannot_delete_self", "不能删除当前登录的管理员账号")
+    if user.role == "admin" and user.status == "approved":
+        approved_admins = (
+            db.scalar(
+                select(func.count(User.id)).where(
+                    User.role == "admin",
+                    User.status == "approved",
+                )
+            )
+            or 0
+        )
+        if approved_admins <= 1:
+            raise ApiError(409, "last_admin", "不能删除最后一个已批准的管理员")
+    active_upload = db.scalar(
+        select(UploadJob.id)
+        .where(
+            UploadJob.owner_user_id == user.id,
+            UploadJob.status.in_(CAPACITY_STATUSES),
+        )
+        .limit(1)
+    )
+    if active_upload is not None:
+        raise ApiError(409, "user_has_active_uploads", "该用户仍有活跃上传任务，请先结束上传")
+
+    target = {
+        "username": user.username,
+        "role": user.role,
+        "status": user.status,
+    }
+    auth: AuthService = request.app.state.auth
+    auth.revoke_user_sessions(db, user.id)
+    audit(db, admin, "user.deleted", "user", user.id, target)
+    db.delete(user)
+    db.commit()
+    request.app.state.uploads.refresh_snapshot()
 
 
 @router.get("/channels")

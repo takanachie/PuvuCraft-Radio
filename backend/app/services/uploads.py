@@ -218,6 +218,10 @@ class UploadManager:
 
         self._loop.call_soon_threadsafe(publish)
 
+    def refresh_snapshot(self) -> None:
+        self._wake_scheduler()
+        self._publish_snapshot()
+
     def reserve(
         self,
         owner: User,

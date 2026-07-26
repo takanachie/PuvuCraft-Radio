@@ -79,6 +79,53 @@ async function setStatus(user: User, status: UserStatus) {
   }
 }
 
+async function promote(user: User) {
+  if (
+    busyId.value !== null
+    || user.role !== 'listener'
+    || effectiveStatus(user) !== 'approved'
+  ) return
+  if (!window.confirm(
+    `确定将 ${user.username} 提升为管理员吗？该用户的现有会话会立即失效，重新登录后将获得全部管理权限。`,
+  )) return
+
+  busyId.value = user.id
+  error.value = ''
+  notice.value = ''
+  try {
+    await api.admin.promoteUser(user.id)
+    notice.value = `已将 ${user.username} 提升为管理员；其现有会话已失效。`
+    await load()
+  } catch (cause) {
+    error.value = userFacingError(cause, '用户提权失败')
+  } finally {
+    busyId.value = null
+  }
+}
+
+async function removeUser(user: User) {
+  if (
+    busyId.value !== null
+    || String(user.id) === String(session.state.user?.id)
+  ) return
+  if (!window.confirm(
+    `永久删除用户“${user.username}”？其登录会话和上传任务记录会一并删除，已导入的音频不会删除。此操作不可撤销。`,
+  )) return
+
+  busyId.value = user.id
+  error.value = ''
+  notice.value = ''
+  try {
+    await api.admin.deleteUser(user.id)
+    notice.value = `已永久删除用户 ${user.username}。`
+    await load()
+  } catch (cause) {
+    error.value = userFacingError(cause, '用户删除失败')
+  } finally {
+    busyId.value = null
+  }
+}
+
 onMounted(() => void load())
 </script>
 
@@ -88,7 +135,7 @@ onMounted(() => void load())
       <div>
         <span class="eyebrow">Access control</span>
         <h2>用户与审批</h2>
-        <p>批准新听众，或立即撤销现有账号的会话权限。</p>
+        <p>批准新听众、授予管理员权限，或停用及永久删除现有账号。</p>
       </div>
       <div class="metric-block">
         <strong>{{ pendingCount }}</strong>
@@ -145,6 +192,20 @@ onMounted(() => void load())
                   @click="setStatus(user, 'disabled')"
                 >停用</button>
                 <button v-else class="button button--positive button--small" type="button" :disabled="busyId !== null" @click="setStatus(user, 'approved')">重新启用</button>
+                <button
+                  v-if="user.role === 'listener' && effectiveStatus(user) === 'approved'"
+                  class="button button--positive button--small"
+                  type="button"
+                  :disabled="busyId !== null"
+                  @click="promote(user)"
+                >提升为管理员</button>
+                <button
+                  class="button button--danger button--small"
+                  type="button"
+                  :disabled="busyId !== null || String(user.id) === String(session.state.user?.id)"
+                  :title="String(user.id) === String(session.state.user?.id) ? '不能删除当前登录账号' : '永久删除用户'"
+                  @click="removeUser(user)"
+                >删除</button>
               </td>
             </tr>
           </template>
