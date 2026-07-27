@@ -236,6 +236,7 @@ class StreamingConfig(StrictModel):
 class StreamAccessConfig(StrictModel):
     nginx_auth_request_path: str
     authorization_cache_seconds: int = Field(default=5, ge=0)
+    listener_timeout_seconds: int = Field(default=20, ge=5, le=300)
     allow_anonymous: bool = False
 
 

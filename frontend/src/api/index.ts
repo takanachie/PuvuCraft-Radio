@@ -2,6 +2,7 @@ import { request, unwrapEntity, unwrapList } from './client'
 import type {
   Channel,
   ChannelInput,
+  CurrentListener,
   EntityId,
   MessageResponse,
   MusicLibrary,
@@ -75,6 +76,12 @@ export const api = {
   admin: {
     async users(): Promise<User[]> {
       return unwrapList<User>(await request<unknown>('/api/admin/users'), ['users'])
+    },
+    async listeners(): Promise<CurrentListener[]> {
+      return unwrapList<CurrentListener>(
+        await request<unknown>('/api/admin/listeners'),
+        ['listeners'],
+      )
     },
     async updateUser(userId: EntityId, status: UserStatus): Promise<User | undefined> {
       const payload = await request<unknown>(`/api/admin/users/${id(userId)}`, {

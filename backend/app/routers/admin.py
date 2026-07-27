@@ -76,13 +76,90 @@ def audit(
     )
 
 
+def current_listener_states(
+    request: Request,
+    db: Session,
+) -> dict[int, dict[str, object]]:
+    presence_by_user = request.app.state.listeners.snapshot_by_user()
+    channel_ids = {
+        presence.channel_id
+        for presences in presence_by_user.values()
+        for presence in presences
+    }
+    channels_by_id = (
+        {
+            channel.id: channel
+            for channel in db.scalars(
+                select(Channel).where(
+                    Channel.id.in_(channel_ids),
+                    Channel.enabled.is_(True),
+                )
+            ).all()
+        }
+        if channel_ids
+        else {}
+    )
+
+    states: dict[int, dict[str, object]] = {}
+    for user_id, presences in presence_by_user.items():
+        active = [
+            (presence, channel)
+            for presence in presences
+            if (channel := channels_by_id.get(presence.channel_id)) is not None
+        ]
+        if not active:
+            continue
+        states[user_id] = {
+            "online": True,
+            "channels": [
+                {
+                    "id": channel.id,
+                    "name": channel.name,
+                    "slug": channel.slug,
+                    "last_seen_at": iso(presence.last_seen_at),
+                }
+                for presence, channel in active
+            ],
+            "last_seen_at": iso(max(presence.last_seen_at for presence, _channel in active)),
+        }
+    return states
+
+
+def offline_listener_state() -> dict[str, object]:
+    return {"online": False, "channels": [], "last_seen_at": None}
+
+
 @router.get("/users")
 def list_users(
+    request: Request,
     _admin: User = Depends(require_admin_read),
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
     users = db.scalars(select(User).order_by(User.created_at.desc())).all()
-    return [user_dict(user) for user in users]
+    listening_states = current_listener_states(request, db)
+    result: list[dict[str, object]] = []
+    for user in users:
+        serialized = user_dict(user)
+        serialized["listening"] = listening_states.get(user.id, offline_listener_state())
+        result.append(serialized)
+    return result
+
+
+@router.get("/listeners")
+def list_current_listeners(
+    request: Request,
+    _admin: User = Depends(require_admin_read),
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    states = current_listener_states(request, db)
+    return [
+        {"user_id": user_id, **state}
+        for user_id, state in sorted(
+            states.items(),
+            key=lambda item: str(item[1]["last_seen_at"]),
+            reverse=True,
+        )
+    ]
 
 
 @router.patch("/users/{user_id}")
@@ -123,6 +200,8 @@ def update_user(
     )
     db.commit()
     db.refresh(user)
+    if payload.status != "approved":
+        request.app.state.listeners.remove_user(user.id)
     return {"user": user_dict(user)}
 
 
@@ -159,6 +238,7 @@ def update_user_role(
     )
     db.commit()
     db.refresh(user)
+    request.app.state.listeners.remove_user(user.id)
     return {"user": user_dict(user)}
 
 
@@ -207,6 +287,7 @@ def delete_user(
     audit(db, admin, "user.deleted", "user", user.id, target)
     db.delete(user)
     db.commit()
+    request.app.state.listeners.remove_user(user_id)
     request.app.state.uploads.refresh_snapshot()
 
 

@@ -27,6 +27,7 @@ const display = computed(() => {
     pending_approval: '待审批',
     rejected: '已拒绝',
     disabled: '已停用',
+    online: '正在收听',
     available: '可用',
     unavailable: '不可用',
     queued: '排队中',

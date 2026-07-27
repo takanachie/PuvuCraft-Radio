@@ -5,7 +5,7 @@ from contextlib import closing
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from backend.app.models import AuditEvent, User
+from backend.app.models import AuditEvent, Channel, User
 
 from .conftest import csrf_headers
 
@@ -70,6 +70,16 @@ def test_registration_approval_and_session_revocation(
         assert login.status_code == 200
         assert listener.get("/api/channels").status_code == 200
         assert listener.get("/api/admin/users").status_code == 403
+        assert listener.get("/api/admin/listeners").status_code == 403
+        with admin.app.state.database.session_factory.begin() as db:
+            channel = db.get(Channel, 1)
+            assert channel is not None and channel.playback_state is not None
+            channel.playback_state.status = "live"
+        assert listener.get(
+            "/api/internal/stream-auth",
+            headers={"X-Original-URI": "/hls/default/index.m3u8"},
+        ).status_code == 204
+        assert admin.app.state.listeners.count(1) == 1
 
         disabled = admin.patch(
             f"/api/admin/users/{user_id}",
@@ -77,6 +87,8 @@ def test_registration_approval_and_session_revocation(
             headers=csrf_headers(admin),
         )
         assert disabled.status_code == 200
+        assert admin.app.state.listeners.count(1) == 0
+        assert admin.get("/api/admin/listeners").json() == []
         assert listener.get("/api/auth/me").status_code == 401
 
 

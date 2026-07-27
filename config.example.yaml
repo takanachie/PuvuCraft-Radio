@@ -144,6 +144,7 @@ streaming:
 stream_access:
   nginx_auth_request_path: "/api/internal/stream-auth"
   authorization_cache_seconds: 5
+  listener_timeout_seconds: 20
   allow_anonymous: false
 
 events:

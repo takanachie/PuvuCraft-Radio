@@ -179,6 +179,60 @@ def test_hls_is_protected_and_authorized_by_channel(initialized_admin: TestClien
     assert client.get("/api/internal/admin-auth").status_code == 204
 
 
+def test_hls_activity_is_exposed_as_current_listener_status(
+    initialized_admin: TestClient,
+) -> None:
+    client = initialized_admin
+    current_user = client.get("/api/auth/me").json()["user"]
+    with client.app.state.database.session_factory.begin() as db:
+        channel = db.get(Channel, 1)
+        assert channel is not None and channel.playback_state is not None
+        channel_name = channel.name
+        channel.playback_state.status = "live"
+
+    users = client.get("/api/admin/users").json()
+    current = next(user for user in users if user["id"] == current_user["id"])
+    assert current["listening"] == {
+        "online": False,
+        "channels": [],
+        "last_seen_at": None,
+    }
+
+    denied = client.get(
+        "/api/internal/stream-auth",
+        headers={"X-Original-URI": "/hls/not-found/index.m3u8"},
+    )
+    assert denied.status_code == 403
+    assert client.app.state.listeners.count(1) == 0
+
+    for path in ("/hls/default/index.m3u8", "/hls/default/g1-seg-1.ts"):
+        allowed = client.get(
+            "/api/internal/stream-auth",
+            headers={"X-Original-URI": path},
+        )
+        assert allowed.status_code == 204
+
+    assert client.app.state.listeners.count(1) == 1
+    users = client.get("/api/admin/users").json()
+    current = next(user for user in users if user["id"] == current_user["id"])
+    assert current["listening"]["online"] is True
+    assert current["listening"]["last_seen_at"].endswith("Z")
+    assert current["listening"]["channels"] == [
+        {
+            "id": 1,
+            "name": channel_name,
+            "slug": "default",
+            "last_seen_at": current["listening"]["last_seen_at"],
+        }
+    ]
+    assert client.get("/api/admin/listeners").json() == [
+        {
+            "user_id": current_user["id"],
+            **current["listening"],
+        }
+    ]
+
+
 def test_upload_rejects_unsupported_extension(initialized_admin: TestClient) -> None:
     client = initialized_admin
     response = client.post(

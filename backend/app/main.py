@@ -13,6 +13,7 @@ from .database import Database
 from .errors import install_error_handlers
 from .routers import admin, auth, channels, uploads
 from .security import AuthService, BootstrapManager, RateLimiter
+from .services.listeners import ListenerRegistry
 from .services.media import MediaService
 from .services.playback import PlaybackManager
 from .services.storage import StorageManager
@@ -55,7 +56,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     bootstrap = BootstrapManager(settings)
     storage = StorageManager(settings)
     media = MediaService(settings, storage)
-    playback = PlaybackManager(settings, database, storage)
+    listeners = ListenerRegistry(settings.stream_access.listener_timeout_seconds)
+    playback = PlaybackManager(settings, database, storage, listeners)
     upload_manager = UploadManager(database, media, storage)
 
     @asynccontextmanager
@@ -96,6 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.rate_limiter = RateLimiter()
     app.state.storage = storage
     app.state.media = media
+    app.state.listeners = listeners
     app.state.playback = playback
     app.state.uploads = upload_manager
 

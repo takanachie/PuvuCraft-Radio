@@ -29,6 +29,7 @@ from ..models import (
 from ..security import aware_utc
 from ..serializers import iso, track_dict
 from .events import EventBroker
+from .listeners import ListenerRegistry
 from .storage import StorageManager, StorageUnavailable
 from .timeline import (
     TimelineSelection,
@@ -67,10 +68,12 @@ class PlaybackManager:
         settings: Settings,
         database: Database,
         storage: StorageManager,
+        listeners: ListenerRegistry,
     ) -> None:
         self.settings = settings
         self.database = database
         self.storage = storage
+        self.listeners = listeners
         self.events = EventBroker()
         self._supervisors: dict[int, ChannelSupervisor] = {}
         self._snapshots: dict[int, dict[str, object]] = {}
@@ -161,6 +164,7 @@ class PlaybackManager:
                 slug = channel.slug if channel else ""
             current = self._supervisors.get(channel_id)
             if not enabled:
+                self.listeners.remove_channel(channel_id)
                 if current:
                     self._supervisors.pop(channel_id, None)
                     await current.stop()
@@ -195,6 +199,7 @@ class PlaybackManager:
     async def _remove(self, channel_id: int) -> None:
         lock = self._channel_locks.setdefault(channel_id, asyncio.Lock())
         async with lock:
+            self.listeners.remove_channel(channel_id)
             supervisor = self._supervisors.pop(channel_id, None)
             if supervisor:
                 await supervisor.stop()
@@ -210,7 +215,7 @@ class PlaybackManager:
             supervisor.command(command)
 
     def update_snapshot(self, channel_id: int, snapshot: dict[str, object]) -> None:
-        snapshot = {**snapshot, "listener_count": self.events.listener_count(channel_id)}
+        snapshot = {**snapshot, "listener_count": self.listeners.count(channel_id)}
         self._snapshots[channel_id] = snapshot
         self.events.publish(
             channel_id,
@@ -262,7 +267,7 @@ class PlaybackManager:
         value = self._snapshots.get(channel_id)
         if value is None:
             return None
-        return {**value, "listener_count": self.events.listener_count(channel_id)}
+        return {**value, "listener_count": self.listeners.count(channel_id)}
 
 
 class ChannelSupervisor:

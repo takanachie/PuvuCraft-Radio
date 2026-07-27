@@ -47,6 +47,13 @@ def test_upload_queue_limit_is_fixed_at_twenty(settings: Settings) -> None:
         Settings.model_validate(payload)
 
 
+def test_listener_presence_timeout_has_a_safe_lower_bound(settings: Settings) -> None:
+    payload = settings.model_dump()
+    payload["stream_access"]["listener_timeout_seconds"] = 4
+    with pytest.raises(ValidationError):
+        Settings.model_validate(payload)
+
+
 def test_storage_location_ids_must_be_unique(settings: Settings) -> None:
     payload = settings.model_dump()
     payload["storage"]["locations"].append(payload["storage"]["locations"][0].copy())

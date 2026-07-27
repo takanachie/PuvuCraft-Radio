@@ -150,7 +150,7 @@ def _sse(event: str, payload: dict[str, object]) -> str:
 @router.get("/api/internal/stream-auth", status_code=204)
 def stream_authorization(
     request: Request,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
     original_uri = request.headers.get("X-Original-URI", "")
@@ -158,7 +158,7 @@ def stream_authorization(
     match = _HLS_URI.fullmatch(path)
     if not match:
         raise ApiError(403, "invalid_stream_path", "无效的音频流地址")
-    channel = db.scalar(
+    channel_id = db.scalar(
         select(Channel.id)
         .join(PlaybackState, PlaybackState.channel_id == Channel.id)
         .where(
@@ -167,8 +167,9 @@ def stream_authorization(
             PlaybackState.status == "live",
         )
     )
-    if channel is None:
+    if channel_id is None:
         raise ApiError(403, "stream_unavailable", "频道当前不可用")
+    request.app.state.listeners.touch(user.id, channel_id)
     return Response(status_code=204)
 
 
@@ -183,7 +184,8 @@ def admin_authorization(_user: User = Depends(get_current_user)) -> Response:
 def development_hls(
     slug: str,
     file_path: str,
-    _user: User = Depends(get_current_user),
+    request: Request,
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> FileResponse:
@@ -191,7 +193,7 @@ def development_hls(
         raise ApiError(404, "stream_not_found", "音频流不存在")
     if not re.fullmatch(r"(?:index\.m3u8|g[0-9]+-seg-[0-9]+\.ts)", file_path):
         raise ApiError(404, "stream_not_found", "音频流不存在")
-    if not db.scalar(
+    channel_id = db.scalar(
         select(Channel.id)
         .join(PlaybackState, PlaybackState.channel_id == Channel.id)
         .where(
@@ -199,12 +201,14 @@ def development_hls(
             Channel.enabled.is_(True),
             PlaybackState.status == "live",
         )
-    ):
+    )
+    if channel_id is None:
         raise ApiError(404, "stream_not_found", "音频流不存在")
     root = (settings.paths.hls_dir / slug).resolve()
     target = (root / file_path).resolve()
     if root not in target.parents or not target.is_file():
         raise ApiError(404, "stream_not_found", "音频流尚未就绪")
+    request.app.state.listeners.touch(user.id, channel_id)
     media_type = "application/vnd.apple.mpegurl" if target.suffix == ".m3u8" else "video/mp2t"
     return FileResponse(target, media_type=media_type)
 

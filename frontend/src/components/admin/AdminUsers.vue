@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../../api'
 import { userFacingError } from '../../api/client'
-import type { EntityId, User, UserStatus } from '../../api/types'
+import type { EntityId, ListeningState, User, UserStatus } from '../../api/types'
 import { session } from '../../session'
 import { formatDateTime } from '../../utils/format'
 import InlineNotice from '../InlineNotice.vue'
@@ -13,10 +13,15 @@ const loading = ref(true)
 const busyId = ref<EntityId | null>(null)
 const error = ref('')
 const notice = ref('')
-const filter = ref<'all' | UserStatus>('all')
+type UserFilter = 'all' | UserStatus | 'online'
+const filter = ref<UserFilter>('all')
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+let loadInFlight = false
+let listeningLoadInFlight = false
 
-const filters: Array<{ value: 'all' | UserStatus; label: string }> = [
+const filters: Array<{ value: UserFilter; label: string }> = [
   { value: 'all', label: '全部' },
+  { value: 'online', label: '正在收听' },
   { value: 'pending', label: '待审批' },
   { value: 'approved', label: '已批准' },
   { value: 'disabled', label: '已停用' },
@@ -28,10 +33,16 @@ function effectiveStatus(user: User): UserStatus {
   return user.status
 }
 
+function isListening(user: User): boolean {
+  return user.listening?.online === true
+}
+
 const filteredUsers = computed(() => {
   const source = filter.value === 'all'
     ? users.value
-    : users.value.filter((user) => effectiveStatus(user) === filter.value)
+    : filter.value === 'online'
+      ? users.value.filter(isListening)
+      : users.value.filter((user) => effectiveStatus(user) === filter.value)
   return [...source].sort((a, b) => {
     if (effectiveStatus(a) === 'pending' && effectiveStatus(b) !== 'pending') return -1
     if (effectiveStatus(b) === 'pending' && effectiveStatus(a) !== 'pending') return 1
@@ -40,8 +51,15 @@ const filteredUsers = computed(() => {
 })
 
 const pendingCount = computed(() => users.value.filter((user) => effectiveStatus(user) === 'pending').length)
+const listeningCount = computed(() => users.value.filter(isListening).length)
+
+function offlineListening(): ListeningState {
+  return { online: false, channels: [], last_seen_at: null }
+}
 
 async function load() {
+  if (loadInFlight) return
+  loadInFlight = true
   loading.value = true
   error.value = ''
   try {
@@ -49,7 +67,31 @@ async function load() {
   } catch (cause) {
     error.value = userFacingError(cause, '无法读取用户列表')
   } finally {
+    loadInFlight = false
     loading.value = false
+  }
+}
+
+async function refreshListening() {
+  if (listeningLoadInFlight || loadInFlight) return
+  listeningLoadInFlight = true
+  try {
+    const active = await api.admin.listeners()
+    const byUserId = new Map(active.map((item) => [String(item.user_id), item]))
+    for (const user of users.value) {
+      const listening = byUserId.get(String(user.id))
+      user.listening = listening
+        ? {
+            online: listening.online,
+            channels: listening.channels,
+            last_seen_at: listening.last_seen_at,
+          }
+        : offlineListening()
+    }
+  } catch {
+    // Keep the last known indicators until the next partial refresh succeeds.
+  } finally {
+    listeningLoadInFlight = false
   }
 }
 
@@ -126,7 +168,14 @@ async function removeUser(user: User) {
   }
 }
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  refreshTimer = setInterval(() => void refreshListening(), 5_000)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer) clearInterval(refreshTimer)
+})
 </script>
 
 <template>
@@ -137,9 +186,15 @@ onMounted(() => void load())
         <h2>用户与审批</h2>
         <p>批准新听众、授予管理员权限，或停用及永久删除现有账号。</p>
       </div>
-      <div class="metric-block">
-        <strong>{{ pendingCount }}</strong>
-        <span>PENDING</span>
+      <div class="metric-pair">
+        <div>
+          <strong>{{ listeningCount }}</strong>
+          <span>LISTENING</span>
+        </div>
+        <div>
+          <strong>{{ pendingCount }}</strong>
+          <span>PENDING</span>
+        </div>
       </div>
     </header>
 
@@ -163,11 +218,11 @@ onMounted(() => void load())
     <div class="data-frame">
       <table class="console-table user-table">
         <thead>
-          <tr><th>用户</th><th>角色</th><th>状态</th><th>申请时间</th><th>最近登录</th><th class="align-right">操作</th></tr>
+          <tr><th>用户</th><th>角色</th><th>账号状态</th><th>收听状态</th><th>申请时间</th><th>最近登录</th><th class="align-right">操作</th></tr>
         </thead>
         <tbody>
-          <tr v-if="loading"><td colspan="6" class="table-message">正在读取账号总线…</td></tr>
-          <tr v-else-if="!filteredUsers.length"><td colspan="6" class="table-message">当前筛选条件下没有用户。</td></tr>
+          <tr v-if="loading"><td colspan="7" class="table-message">正在读取账号总线…</td></tr>
+          <tr v-else-if="!filteredUsers.length"><td colspan="7" class="table-message">当前筛选条件下没有用户。</td></tr>
           <template v-else>
             <tr v-for="user in filteredUsers" :key="user.id">
               <td data-label="用户">
@@ -175,7 +230,16 @@ onMounted(() => void load())
                 <small>{{ user.email }}</small>
               </td>
               <td data-label="角色"><span class="mono-label">{{ user.role.toUpperCase() }}</span></td>
-              <td data-label="状态"><StatusBadge :status="effectiveStatus(user)" /></td>
+              <td data-label="账号状态"><StatusBadge :status="effectiveStatus(user)" /></td>
+              <td data-label="收听状态">
+                <StatusBadge :status="isListening(user) ? 'online' : 'offline'" />
+                <small
+                  v-if="isListening(user)"
+                  :title="`最近收到音频流请求：${formatDateTime(user.listening?.last_seen_at)}`"
+                >
+                  {{ user.listening?.channels.map((item) => item.name).join(' / ') }}
+                </small>
+              </td>
               <td data-label="申请时间">{{ formatDateTime(user.created_at) }}</td>
               <td data-label="最近登录">{{ formatDateTime(user.last_login_at) }}</td>
               <td data-label="操作" class="table-actions">

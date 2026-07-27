@@ -42,6 +42,23 @@ export interface RegistrationResponse {
   user?: User
 }
 
+export interface ListeningChannel {
+  id: EntityId
+  name: string
+  slug: string
+  last_seen_at: string
+}
+
+export interface ListeningState {
+  online: boolean
+  channels: ListeningChannel[]
+  last_seen_at: string | null
+}
+
+export interface CurrentListener extends ListeningState {
+  user_id: EntityId
+}
+
 export interface User {
   id: EntityId
   username: string
@@ -54,6 +71,7 @@ export interface User {
   updated_at?: string
   approved_at?: string | null
   last_login_at?: string | null
+  listening?: ListeningState
 }
 
 export interface TrackSummary {
