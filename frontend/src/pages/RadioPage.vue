@@ -3,7 +3,13 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { userFacingError } from '../api/client'
-import type { Channel, PlaybackState, TrackSummary } from '../api/types'
+import type {
+  Channel,
+  PlaybackState,
+  PlayerKeyState,
+  PlayerStreamFormat,
+  TrackSummary,
+} from '../api/types'
 import ConsoleHeader from '../components/ConsoleHeader.vue'
 import InlineNotice from '../components/InlineNotice.vue'
 import StatusBadge from '../components/StatusBadge.vue'
@@ -26,6 +32,12 @@ const eventsState = ref<'connecting' | 'connected' | 'reconnecting'>('connecting
 const playback = ref<PlaybackState>({ status: 'starting', position_seconds: 0 })
 const receivedAt = ref(Date.now())
 const clock = ref(Date.now())
+const playerKey = ref<PlayerKeyState | null>(null)
+const playerKeyLoading = ref(true)
+const playerKeyBusy = ref(false)
+const playerKeyError = ref('')
+const playerKeyNotice = ref('')
+const playerStreamFormat = ref<PlayerStreamFormat>('aac')
 
 let eventSource: EventSource | null = null
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -60,6 +72,27 @@ const transportLabel = computed(() => {
   }
   return labels[player.state.value] || player.state.value
 })
+const canCopyPlayerUrl = computed(() =>
+  Boolean(
+    selectedChannel.value
+    && playerKey.value?.configured
+    && playerKey.value.valid_for_new_connections,
+  ),
+)
+
+function formatPlayerDate(value: string | null | undefined): string {
+  if (!value) return '尚未生成'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '时间不可用'
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
+}
 
 function hlsUrl(slug: string): string {
   return `/hls/${encodeURIComponent(slug)}/index.m3u8`
@@ -189,12 +222,66 @@ async function loadChannels() {
   }
 }
 
+async function loadPlayerKey() {
+  playerKeyLoading.value = true
+  playerKeyError.value = ''
+  try {
+    playerKey.value = await api.auth.playerKey()
+    if (!playerKey.value.lossless_available) playerStreamFormat.value = 'aac'
+  } catch (cause) {
+    playerKeyError.value = userFacingError(cause, '无法读取播放器连接状态')
+  } finally {
+    playerKeyLoading.value = false
+  }
+}
+
+async function refreshPlayerKey() {
+  if (playerKeyBusy.value) return
+  playerKeyBusy.value = true
+  playerKeyError.value = ''
+  playerKeyNotice.value = ''
+  try {
+    playerKey.value = await api.auth.regeneratePlayerKey()
+    playerKeyNotice.value = '有效日期已刷新，之前复制的播放器连接已立即失效。'
+  } catch (cause) {
+    playerKeyError.value = userFacingError(cause, '无法刷新播放器连接有效日期')
+  } finally {
+    playerKeyBusy.value = false
+  }
+}
+
+async function copyPlayerUrl() {
+  const target = selectedChannel.value
+  if (!target || !canCopyPlayerUrl.value || playerKeyBusy.value) return
+  playerKeyBusy.value = true
+  playerKeyError.value = ''
+  playerKeyNotice.value = ''
+  try {
+    const result = await api.auth.playerUrl({
+      channel_id: target.id,
+      stream_format: playerStreamFormat.value,
+    })
+    if (!navigator.clipboard?.writeText) {
+      throw new Error('当前浏览器不允许安全复制')
+    }
+    await navigator.clipboard.writeText(result.url)
+    playerKeyNotice.value = `已复制“${target.name}”的播放器连接。`
+  } catch (cause) {
+    playerKeyError.value = userFacingError(cause, '无法复制播放器连接')
+  } finally {
+    playerKeyBusy.value = false
+  }
+}
+
 function changeVolume(event: Event) {
   player.setVolume(Number((event.target as HTMLInputElement).value))
 }
 
 watch(selectedId, (value, previous) => {
-  if (value && value !== previous) void loadChannel(value)
+  if (value && value !== previous) {
+    playerKeyNotice.value = ''
+    void loadChannel(value)
+  }
 })
 
 onMounted(() => {
@@ -202,6 +289,7 @@ onMounted(() => {
     clock.value = Date.now()
   }, 250)
   void loadChannels()
+  void loadPlayerKey()
 })
 
 onBeforeUnmount(() => {
@@ -344,6 +432,78 @@ onBeforeUnmount(() => {
           </div>
         </section>
       </template>
+
+      <section class="player-link-panel" aria-labelledby="player-link-title" :aria-busy="playerKeyLoading || playerKeyBusy">
+        <div class="player-link-panel__heading">
+          <div>
+            <span class="eyebrow">External player</span>
+            <h2 id="player-link-title">FM / 播放器连接</h2>
+          </div>
+          <StatusBadge
+            :status="playerKey?.valid_for_new_connections ? 'approved' : 'expired'"
+            :label="playerKeyLoading ? '读取中' : playerKey?.valid_for_new_connections ? '可建立连接' : '需刷新日期'"
+          />
+        </div>
+
+        <p class="player-link-panel__copy">
+          复制当前频道的持续音频连接，可用于支持网络音频流的 FM 或媒体播放器。连接中不提供曲目、歌手或版权元数据。
+        </p>
+
+        <dl class="player-link-dates">
+          <div>
+            <dt>创建时间</dt>
+            <dd>{{ formatPlayerDate(playerKey?.created_at) }}</dd>
+          </div>
+          <div>
+            <dt>最晚建立连接时间</dt>
+            <dd>{{ formatPlayerDate(playerKey?.connect_before) }}</dd>
+          </div>
+        </dl>
+
+        <div class="player-link-controls">
+          <div class="player-link-channel">
+            <span>当前频道</span>
+            <strong>{{ selectedChannel?.name || '尚未选择频道' }}</strong>
+          </div>
+          <label v-if="playerKey?.lossless_available" for="player-stream-format">
+            音频格式
+            <select id="player-stream-format" v-model="playerStreamFormat" :disabled="playerKeyBusy">
+              <option value="aac">AAC · 320 kbps</option>
+              <option value="flac">FLAC · 44.1 kHz / 16 bit</option>
+            </select>
+          </label>
+          <div v-else class="player-link-format">
+            <span>音频格式</span>
+            <strong>AAC · 320 kbps</strong>
+          </div>
+          <button
+            class="button button--primary"
+            type="button"
+            :disabled="playerKeyLoading || playerKeyBusy || !canCopyPlayerUrl"
+            @click="copyPlayerUrl"
+          >
+            复制当前频道连接
+          </button>
+          <button
+            class="button button--quiet"
+            type="button"
+            :disabled="playerKeyLoading || playerKeyBusy"
+            @click="refreshPlayerKey"
+          >
+            刷新有效日期
+          </button>
+        </div>
+
+        <InlineNotice v-if="playerKeyError" tone="danger" title="播放器连接未更新">
+          {{ playerKeyError }}
+        </InlineNotice>
+        <p v-if="playerKeyNotice" class="player-link-panel__notice" role="status">
+          {{ playerKeyNotice }}
+        </p>
+        <p class="player-link-panel__warning">
+          刷新有效日期会重新生成内部凭据，正在使用及此前复制的连接将失效。播放凭据不会显示在页面中。
+        </p>
+      </section>
     </main>
     <audio ref="audio" preload="none" playsinline aria-hidden="true"></audio>
   </div>

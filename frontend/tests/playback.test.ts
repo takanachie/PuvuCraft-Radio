@@ -51,6 +51,13 @@ describe('playback utilities', () => {
     }, 20_000)).toBe(12)
   })
 
+  it('advances the logical timeline while an idle channel encoder is stopped', () => {
+    expect(interpolatedPosition({
+      state: { status: 'idle', position_seconds: 12, duration_seconds: 40 },
+      receivedAt: 1_000,
+    }, 6_000)).toBe(17)
+  })
+
   it('resets stale position and duration when a track boundary omits an offset', () => {
     const result = playbackFromEvent({
       type: 'track',

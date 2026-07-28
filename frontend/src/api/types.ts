@@ -2,7 +2,8 @@ export type EntityId = string | number
 export type UserRole = 'admin' | 'listener'
 export type UserStatus = 'pending' | 'approved' | 'rejected' | 'disabled'
 export type PlaybackMode = 'sequential' | 'shuffle'
-export type ChannelState = 'starting' | 'live' | 'degraded' | 'offline' | 'stopped'
+export type ChannelState = 'starting' | 'live' | 'idle' | 'degraded' | 'offline' | 'stopped'
+export type PlayerStreamFormat = 'aac' | 'flac'
 export type UploadJobStatus =
   | 'queued'
   | 'ready'
@@ -40,6 +41,27 @@ export interface RegistrationResponse {
   status?: UserStatus | 'pending_approval'
   message?: string
   user?: User
+}
+
+export interface PlayerKeyState {
+  configured: boolean
+  created_at: string | null
+  connect_before: string | null
+  valid_for_new_connections: boolean
+  lossless_available: boolean
+}
+
+export interface PlayerUrlInput {
+  channel_id: EntityId
+  stream_format: PlayerStreamFormat
+}
+
+export interface PlayerUrlResponse {
+  url: string
+  stream_format: PlayerStreamFormat
+  channel_id: EntityId
+  created_at: string
+  connect_before: string
 }
 
 export interface ListeningChannel {

@@ -6,6 +6,9 @@ import type {
   EntityId,
   MessageResponse,
   MusicLibrary,
+  PlayerKeyState,
+  PlayerUrlInput,
+  PlayerUrlResponse,
   PlaylistItem,
   RegistrationPayload,
   RegistrationResponse,
@@ -56,6 +59,18 @@ export const api = {
     async me(): Promise<User> {
       const payload = await request<unknown>('/api/auth/me')
       return unwrapEntity<User>(payload, ['user'])
+    },
+    async playerKey(): Promise<PlayerKeyState> {
+      return request<PlayerKeyState>('/api/auth/player-key')
+    },
+    async regeneratePlayerKey(): Promise<PlayerKeyState> {
+      return request<PlayerKeyState>('/api/auth/player-key/regenerate', { method: 'POST' })
+    },
+    async playerUrl(input: PlayerUrlInput): Promise<PlayerUrlResponse> {
+      return request<PlayerUrlResponse>('/api/auth/player-key/url', {
+        method: 'POST',
+        json: input,
+      })
     },
   },
 

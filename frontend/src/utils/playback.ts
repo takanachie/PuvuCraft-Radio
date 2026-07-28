@@ -70,7 +70,7 @@ export function playbackFromEvent(
 export function interpolatedPosition(snapshot: TimedPlayback, now = Date.now()): number {
   const state = snapshot.state
   const anchor = state.position_seconds ?? state.elapsed_seconds ?? 0
-  const advances = state.status === 'live'
+  const advances = state.status === 'live' || state.status === 'idle'
   const elapsed = advances ? Math.max(0, (now - snapshot.receivedAt) / 1000) : 0
   const duration = state.duration_seconds ?? state.current_track?.duration_seconds
   return duration && duration > 0 ? clamp(anchor + elapsed, 0, duration) : Math.max(0, anchor + elapsed)

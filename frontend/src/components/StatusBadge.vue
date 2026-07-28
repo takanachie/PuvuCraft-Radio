@@ -9,7 +9,7 @@ const props = defineProps<{
 const normalized = computed(() => (props.status || 'unknown').toLowerCase())
 const tone = computed(() => {
   if (['live', 'approved', 'enabled', 'available', 'online', 'completed'].includes(normalized.value)) return 'good'
-  if (['starting', 'pending', 'pending_approval', 'degraded', 'queued', 'ready', 'uploading', 'verifying', 'normalizing', 'placing'].includes(normalized.value)) return 'warn'
+  if (['starting', 'idle', 'pending', 'pending_approval', 'degraded', 'queued', 'ready', 'uploading', 'verifying', 'normalizing', 'placing'].includes(normalized.value)) return 'warn'
   if (['offline', 'rejected', 'disabled', 'error', 'unavailable', 'failed', 'cancelled', 'expired'].includes(normalized.value)) return 'bad'
   return 'neutral'
 })
@@ -18,6 +18,7 @@ const display = computed(() => {
   if (props.label) return props.label
   const labels: Record<string, string> = {
     live: '直播中',
+    idle: '待机',
     starting: '启动中',
     degraded: '信号异常',
     offline: '离线',

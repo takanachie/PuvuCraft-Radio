@@ -145,7 +145,7 @@ export function useLiveAudio(audioElement: Ref<HTMLAudioElement | null>) {
       enableWorker: true,
       lowLatencyMode: false,
       liveSyncDurationCount: 2,
-      liveMaxLatencyDurationCount: 5,
+      liveMaxLatencyDurationCount: 3,
       backBufferLength: 0,
       xhrSetup(xhr) {
         xhr.withCredentials = true
