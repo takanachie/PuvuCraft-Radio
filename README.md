@@ -13,7 +13,8 @@ PuvuCraft Radio 是基于 FastAPI、Vue 3、FFmpeg 和 HLS 的多频道同步在
 - 所有管理员可见的 10 位持久化上传队列、并行传输和断页清理
 - ffprobe 验证、标签与封面提取，以及超规格音频的 FLAC 规范化
 - 基于优先级和磁盘使用率上限的多挂载媒体存储
-- 每频道持续 HLS 编码器、同步播放时间线、切歌和重启恢复
+- 每频道按需共享的 320 kbps AAC/HLS 编码器、持续逻辑时间线、切歌和重启恢复
+- 带 30 天连接窗口、单连接接管和空 404 防泄露的外部播放器持续流；管理员可选 FLAC
 - Vue 3 深色电台控制台、hls.js 播放器和 SSE 状态更新
 - Nginx `auth_request`、HTTPS 和 systemd 部署模板
 
