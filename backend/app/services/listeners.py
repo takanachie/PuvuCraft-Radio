@@ -24,7 +24,7 @@ class _PresenceEntry:
 
 
 class ListenerRegistry:
-    """Track recent authenticated HLS activity without retaining database objects."""
+    """Track recent authenticated audio activity without retaining database objects."""
 
     def __init__(
         self,

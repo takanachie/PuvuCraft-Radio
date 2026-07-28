@@ -28,6 +28,7 @@ from ..models import (
 )
 from ..security import aware_utc
 from ..serializers import iso, track_dict
+from .audio_streams import AudioFanout, AudioSubscription, FlacAudioFanout
 from .events import EventBroker
 from .listeners import ListenerRegistry
 from .storage import StorageManager, StorageUnavailable
@@ -40,6 +41,26 @@ from .timeline import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class StreamUnavailable(RuntimeError):
+    pass
+
+
+def _bitrate_bytes_per_second(value: str) -> int:
+    normalized = value.strip().lower()
+    multiplier = 1
+    if normalized.endswith("k"):
+        normalized = normalized[:-1]
+        multiplier = 1000
+    elif normalized.endswith("m"):
+        normalized = normalized[:-1]
+        multiplier = 1_000_000
+    try:
+        bits_per_second = float(normalized) * multiplier
+    except ValueError:
+        bits_per_second = 320_000
+    return max(1, int(bits_per_second / 8))
 
 
 def prune_playback_history(db: Session, channel_id: int) -> None:
@@ -79,6 +100,8 @@ class PlaybackManager:
         self._snapshots: dict[int, dict[str, object]] = {}
         self._channel_locks: dict[int, asyncio.Lock] = {}
         self._management_tasks: set[asyncio.Task[object]] = set()
+        self._demand_at: dict[int, float] = {}
+        self._demand_task: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stopping = False
 
@@ -89,15 +112,28 @@ class PlaybackManager:
             channel_ids = db.scalars(select(PlaybackHistory.channel_id).distinct()).all()
             for channel_id in channel_ids:
                 prune_playback_history(db, channel_id)
-        if not self.settings.streaming.always_on:
-            return
         with self.database.session_factory() as db:
-            channel_ids = list(db.scalars(select(Channel.id)).all())
+            channel_ids = list(
+                db.scalars(
+                    select(Channel.id).where(Channel.enabled.is_(True))
+                ).all()
+            )
+        self._demand_task = asyncio.create_task(
+            self._monitor_demand(),
+            name="radio-playback-demand",
+        )
         for channel_id in channel_ids:
-            await self._reconcile(channel_id)
+            if self.settings.streaming.always_on:
+                await self._reconcile(channel_id, force_active=True)
+            else:
+                self._refresh_idle_timeline(channel_id)
 
     async def stop(self) -> None:
         self._stopping = True
+        demand_task, self._demand_task = self._demand_task, None
+        if demand_task is not None:
+            demand_task.cancel()
+            await asyncio.gather(demand_task, return_exceptions=True)
         if self._management_tasks:
             await asyncio.gather(*tuple(self._management_tasks), return_exceptions=True)
         supervisors = list(self._supervisors.values())
@@ -150,10 +186,125 @@ class PlaybackManager:
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
+    def touch_demand(self, channel_id: int) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed() or self._stopping:
+            return
+        loop.call_soon_threadsafe(self._touch_demand, channel_id)
+
+    def _touch_demand(self, channel_id: int) -> None:
+        self._demand_at[channel_id] = time.monotonic()
+
+    async def ensure_hls_stream(self, channel_id: int) -> None:
+        self._touch_demand(channel_id)
+        await self._reconcile(channel_id, force_active=True)
+        supervisor = self._supervisors.get(channel_id)
+        if supervisor is None:
+            raise StreamUnavailable
+        await supervisor.wait_hls_ready(self.settings.player_api.startup_timeout_seconds)
+
+    async def open_audio_stream(
+        self,
+        channel_id: int,
+        stream_format: str,
+    ) -> AudioSubscription:
+        if stream_format not in {"aac", "flac"}:
+            raise StreamUnavailable
+        self._touch_demand(channel_id)
+        await self._reconcile(channel_id, force_active=True)
+        supervisor = self._supervisors.get(channel_id)
+        if supervisor is None:
+            raise StreamUnavailable
+        try:
+            return await supervisor.open_audio_stream(
+                stream_format,
+                self.settings.player_api.startup_timeout_seconds,
+            )
+        except (FileNotFoundError, RuntimeError, TimeoutError) as exc:
+            raise StreamUnavailable from exc
+
+    async def _monitor_demand(self) -> None:
+        refresh_interval = self.settings.streaming.playback.state_checkpoint_seconds
+        next_idle_refresh = time.monotonic() + refresh_interval
+        try:
+            while not self._stopping:
+                await asyncio.sleep(1)
+                now = time.monotonic()
+                for channel_id, supervisor in tuple(self._supervisors.items()):
+                    await supervisor.stop_lossless_if_idle(
+                        now,
+                        self.settings.streaming.idle_shutdown_seconds,
+                    )
+                    if self.settings.streaming.always_on:
+                        continue
+                    if (
+                        self.listeners.count(channel_id) > 0
+                        or supervisor.audio_listener_count > 0
+                    ):
+                        continue
+                    last_demand = self._demand_at.setdefault(channel_id, now)
+                    if (
+                        now - last_demand
+                        >= self.settings.streaming.idle_shutdown_seconds
+                    ):
+                        await self._deactivate_if_idle(channel_id, supervisor)
+                if now >= next_idle_refresh:
+                    with self.database.session_factory() as db:
+                        idle_ids = list(
+                            db.scalars(
+                                select(Channel.id).where(Channel.enabled.is_(True))
+                            ).all()
+                        )
+                    for channel_id in idle_ids:
+                        if channel_id not in self._supervisors:
+                            self._refresh_idle_timeline(channel_id)
+                    next_idle_refresh = now + refresh_interval
+        except asyncio.CancelledError:
+            raise
+
+    async def _deactivate_if_idle(
+        self,
+        channel_id: int,
+        supervisor: ChannelSupervisor,
+    ) -> None:
+        lock = self._channel_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            if self._supervisors.get(channel_id) is not supervisor:
+                return
+            if (
+                self.listeners.count(channel_id) > 0
+                or supervisor.audio_listener_count > 0
+            ):
+                return
+            self._supervisors.pop(channel_id, None)
+            await supervisor.stop(preserve_timeline=True)
+            self._demand_at.pop(channel_id, None)
+            self._refresh_idle_timeline(channel_id)
+
+    def _refresh_idle_timeline(self, channel_id: int) -> None:
+        if channel_id in self._supervisors:
+            return
+        with self.database.session_factory() as db:
+            channel = db.get(Channel, channel_id)
+            if channel is None or not channel.enabled:
+                return
+            selection = recover_timeline(db, channel_id)
+            state = channel.playback_state
+            if state is None:
+                state = PlaybackState(channel=channel)
+                db.add(state)
+            state.status = "idle" if selection is not None else "offline"
+            state.ffmpeg_pid = None
+            if selection is not None:
+                state.last_error = None
+            state.updated_at = utcnow()
+            db.commit()
+        self.publish_persisted_snapshot(channel_id, ffmpeg_running=False)
+
     def reconcile(self, channel_id: int) -> None:
         self._schedule(lambda: self._reconcile(channel_id))
 
-    async def _reconcile(self, channel_id: int) -> None:
+    async def _reconcile(self, channel_id: int, *, force_active: bool = False) -> None:
         lock = self._channel_locks.setdefault(channel_id, asyncio.Lock())
         async with lock:
             if self._stopping:
@@ -165,6 +316,7 @@ class PlaybackManager:
             current = self._supervisors.get(channel_id)
             if not enabled:
                 self.listeners.remove_channel(channel_id)
+                self._demand_at.pop(channel_id, None)
                 if current:
                     self._supervisors.pop(channel_id, None)
                     await current.stop()
@@ -186,11 +338,21 @@ class PlaybackManager:
                 current = None
                 if self._stopping:
                     return
+            should_run = (
+                self.settings.streaming.always_on
+                or force_active
+                or current is not None
+                or self.listeners.count(channel_id) > 0
+            )
+            if not should_run:
+                self._refresh_idle_timeline(channel_id)
+                return
             if current is None:
+                self._demand_at.setdefault(channel_id, time.monotonic())
                 current = ChannelSupervisor(self, channel_id, slug)
                 self._supervisors[channel_id] = current
                 current.start()
-            else:
+            elif not force_active:
                 current.command(ChannelCommand("refresh"))
 
     def remove(self, channel_id: int) -> None:
@@ -213,6 +375,39 @@ class PlaybackManager:
         supervisor = self._supervisors.get(channel_id)
         if supervisor:
             supervisor.command(command)
+            return
+        self._apply_idle_command(channel_id, command)
+
+    def _apply_idle_command(self, channel_id: int, command: ChannelCommand) -> None:
+        with self.database.session_factory() as db:
+            selection = recover_timeline(db, channel_id)
+            if command.kind == "play_now" and command.item_id is not None:
+                try:
+                    selection = force_timeline_item(db, channel_id, command.item_id)
+                except ValueError:
+                    pass
+            elif command.kind == "skip" and selection is not None:
+                channel = db.get(Channel, channel_id)
+                if channel is not None:
+                    state = channel.playback_state or PlaybackState(channel=channel)
+                    db.add(state)
+                    next_item = select_next(
+                        state,
+                        channel,
+                        playable_items(db, channel_id),
+                        selection.item_id,
+                    )
+                    if next_item is not None:
+                        selection = force_timeline_item(db, channel_id, next_item.id)
+            state = db.scalar(
+                select(PlaybackState).where(PlaybackState.channel_id == channel_id)
+            )
+            if state is not None:
+                state.status = "idle" if selection is not None else "offline"
+                state.ffmpeg_pid = None
+                state.updated_at = utcnow()
+                db.commit()
+        self.publish_persisted_snapshot(channel_id, ffmpeg_running=False)
 
     def update_snapshot(self, channel_id: int, snapshot: dict[str, object]) -> None:
         snapshot = {**snapshot, "listener_count": self.listeners.count(channel_id)}
@@ -263,6 +458,51 @@ class PlaybackManager:
         if not self._stopping:
             self.reconcile(supervisor.channel_id)
 
+    def publish_persisted_snapshot(
+        self,
+        channel_id: int,
+        *,
+        ffmpeg_running: bool,
+    ) -> None:
+        with self.database.session_factory() as db:
+            channel = db.get(Channel, channel_id)
+            if channel is None:
+                return
+            state = channel.playback_state
+            item = None
+            if state and state.current_item_id:
+                item = db.scalar(
+                    select(PlaylistItem)
+                    .options(joinedload(PlaylistItem.track))
+                    .where(PlaylistItem.id == state.current_item_id)
+                )
+            now = utcnow()
+            position = state.position_seconds if state else 0
+            if (
+                state
+                and state.status in {"live", "idle"}
+                and state.anchor_at
+            ):
+                position += max(
+                    0,
+                    (now - aware_utc(state.anchor_at)).total_seconds(),
+                )
+            snapshot: dict[str, object] = {
+                "channel_id": channel_id,
+                "status": state.status if state else "starting",
+                "current_item_id": item.id if item else None,
+                "current_track": track_dict(item.track) if item else None,
+                "position_seconds": position,
+                "duration_seconds": item.track.duration_seconds if item else None,
+                "server_time": iso(now),
+                "started_at": iso(state.anchor_at) if state else None,
+                "last_error": state.last_error if state else None,
+                "ffmpeg_running": ffmpeg_running,
+                "restart_count": state.restart_count if state else 0,
+                "last_started_at": iso(state.last_started_at) if state else None,
+            }
+        self.update_snapshot(channel_id, snapshot)
+
     def snapshot(self, channel_id: int) -> dict[str, object] | None:
         value = self._snapshots.get(channel_id)
         if value is None:
@@ -285,8 +525,32 @@ class ChannelSupervisor:
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._encoder: asyncio.subprocess.Process | None = None
+        self._lossless_encoder: asyncio.subprocess.Process | None = None
+        self._lossless_demand_at: float | None = None
+        self._lossless_lock = asyncio.Lock()
         self._decoder: asyncio.subprocess.Process | None = None
         self._stderr_tasks: set[asyncio.Task[None]] = set()
+        self._output_tasks: set[asyncio.Task[None]] = set()
+        self._encoder_ready = asyncio.Event()
+        aac_buffer_bytes = int(
+            _bitrate_bytes_per_second(self.settings.streaming.output.bitrate)
+            * self.settings.player_api.queue_seconds
+        )
+        lossless = self.settings.player_api.lossless
+        lossless_buffer_bytes = int(
+            lossless.sample_rate
+            * lossless.channels
+            * (lossless.sample_bits / 8)
+            * self.settings.player_api.queue_seconds
+        )
+        self._aac_fanout = AudioFanout(
+            aac_buffer_bytes,
+            self.settings.player_api.queue_seconds,
+        )
+        self._lossless_fanout = FlacAudioFanout(
+            lossless_buffer_bytes,
+            self.settings.player_api.queue_seconds,
+        )
         self._recent_errors: deque[str] = deque(maxlen=40)
         self._history_id: int | None = None
 
@@ -296,6 +560,61 @@ class ChannelSupervisor:
 
     def command(self, command: ChannelCommand) -> None:
         self.commands.put_nowait(command)
+
+    @property
+    def audio_listener_count(self) -> int:
+        return self._aac_fanout.listener_count + self._lossless_fanout.listener_count
+
+    async def wait_hls_ready(self, timeout_seconds: float) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        manifest = self._channel_hls_dir() / "index.m3u8"
+        while not manifest.is_file():
+            if self._stopping.is_set() or (
+                self._task is not None and self._task.done()
+            ):
+                raise StreamUnavailable
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            await asyncio.sleep(min(0.1, remaining))
+
+    async def open_audio_stream(
+        self,
+        stream_format: str,
+        timeout_seconds: float,
+    ) -> AudioSubscription:
+        await asyncio.wait_for(
+            self._encoder_ready.wait(),
+            timeout=timeout_seconds,
+        )
+        if self._stopping.is_set():
+            raise StreamUnavailable
+        if stream_format == "aac":
+            return self._aac_fanout.subscribe()
+        if stream_format != "flac":
+            raise StreamUnavailable
+        await self._ensure_lossless_encoder()
+        self._lossless_demand_at = time.monotonic()
+        return self._lossless_fanout.subscribe()
+
+    async def stop_lossless_if_idle(
+        self,
+        now: float,
+        idle_seconds: float,
+    ) -> None:
+        async with self._lossless_lock:
+            if self._lossless_fanout.listener_count > 0:
+                self._lossless_demand_at = now
+                return
+            if self._lossless_encoder is None:
+                self._lossless_demand_at = None
+                return
+            last_demand = self._lossless_demand_at
+            if last_demand is None:
+                self._lossless_demand_at = now
+                return
+            if now - last_demand >= idle_seconds:
+                await self._stop_lossless_encoder_locked()
 
     async def stop(self, preserve_timeline: bool = False) -> None:
         self._stopping.set()
@@ -310,15 +629,16 @@ class ChannelSupervisor:
                     self.channel_id,
                 )
         await self._stop_decoder()
+        await self._stop_lossless_encoder()
         await self._stop_encoder()
         await self._finish_stderr_tasks()
+        await self._finish_output_tasks()
         if task and not task.done():
             task.cancel()
             done, _pending = await asyncio.wait({task}, timeout=2)
             if not done:
                 logger.error("channel %s supervisor task could not be reaped", self.channel_id)
-        if not preserve_timeline:
-            self._set_status("stopped")
+        self._set_status("idle" if preserve_timeline else "stopped")
         if self.settings.streaming.process_control.stale_output_cleanup:
             self._remove_hls_output()
 
@@ -332,6 +652,7 @@ class ChannelSupervisor:
                         with self.database.session_factory() as db:
                             selection = recover_timeline(db, self.channel_id)
                     if selection is None:
+                        await self._stop_lossless_encoder()
                         await self._stop_encoder()
                         self._remove_hls_output()
                         self._set_status("offline", "频道歌单为空或没有可用歌曲")
@@ -344,6 +665,7 @@ class ChannelSupervisor:
                     selection = self._selection_after(command, selection.item_id)
                 except FileNotFoundError as exc:
                     self._set_status("offline", str(exc))
+                    await self._stop_lossless_encoder()
                     await self._stop_encoder()
                     command = await self._wait_for_command(30)
                     selection = self._apply_waiting_command(command)
@@ -359,6 +681,7 @@ class ChannelSupervisor:
                     )
                     self._set_status(status, message or "FFmpeg 播放进程异常")
                     await self._stop_decoder()
+                    await self._stop_lossless_encoder()
                     await self._stop_encoder()
                     selection = None
                     delay = min(
@@ -369,6 +692,7 @@ class ChannelSupervisor:
                     selection = self._apply_waiting_command(command)
         finally:
             await self._stop_decoder()
+            await self._stop_lossless_encoder()
             await self._stop_encoder()
 
     async def _wait_for_command(self, wait_seconds: float) -> ChannelCommand | None:
@@ -414,6 +738,8 @@ class ChannelSupervisor:
     async def _ensure_encoder(self) -> None:
         if self._encoder and self._encoder.returncode is None:
             return
+        if self._encoder is not None:
+            await self._stop_encoder()
         binary = self.settings.ffmpeg.binary
         if not binary.is_file():
             raise FileNotFoundError(f"找不到 FFmpeg：{binary}")
@@ -440,6 +766,22 @@ class ChannelSupervisor:
         hls = self.settings.streaming.hls
         segment_pattern = channel_dir / f"g{generation}-seg-%019d.ts"
         manifest = channel_dir / "index.m3u8"
+        hls_flags = "omit_endlist+temp_file+discont_start"
+        if hls.delete_old_segments:
+            hls_flags = f"delete_segments+{hls_flags}"
+        hls_options = ":".join(
+            (
+                "f=hls",
+                f"hls_segment_type={hls.segment_container}",
+                f"hls_time={hls.segment_duration_seconds}",
+                f"hls_list_size={hls.playlist_segments}",
+                f"hls_delete_threshold={hls.delete_threshold}",
+                f"start_number={start_number}",
+                f"hls_flags={hls_flags}",
+                f"hls_segment_filename={segment_pattern}",
+            )
+        )
+        tee_target = f"[{hls_options}]{manifest}|[f=adts]pipe:1"
         command = [
             str(binary),
             "-hide_banner",
@@ -471,32 +813,22 @@ class ChannelSupervisor:
             str(output.sample_rate),
             "-ac",
             str(output.channels),
+            "-threads",
+            "1",
             "-f",
-            "hls",
-            "-hls_segment_type",
-            hls.segment_container,
-            "-hls_time",
-            str(hls.segment_duration_seconds),
-            "-hls_list_size",
-            str(hls.playlist_segments),
-            "-hls_delete_threshold",
-            str(hls.delete_threshold),
-            "-start_number",
-            str(start_number),
-            "-hls_flags",
-            "delete_segments+omit_endlist+temp_file+discont_start",
-            "-hls_segment_filename",
-            str(segment_pattern),
-            str(manifest),
+            "tee",
+            tee_target,
         ]
         self._encoder = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         self._track_stderr(self._encoder, "encoder")
+        self._track_output(self._encoder, self._aac_fanout, "aac")
+        self._encoder_ready.set()
         with self.database.session_factory.begin() as db:
             state = db.scalar(
                 select(PlaybackState).where(PlaybackState.channel_id == self.channel_id)
@@ -592,14 +924,26 @@ class ChannelSupervisor:
                     or not self._encoder.stdin
                 ):
                     raise RuntimeError("HLS encoder stopped unexpectedly")
-                self._encoder.stdin.write(chunk)
-                try:
-                    await asyncio.wait_for(
-                        self._encoder.stdin.drain(),
-                        timeout=stall_limit,
-                    )
-                except TimeoutError as exc:
-                    raise RuntimeError("HLS encoder stopped accepting audio") from exc
+                await self._write_pcm(
+                    self._encoder,
+                    chunk,
+                    stall_limit,
+                    "HLS encoder",
+                )
+                if (
+                    self._lossless_encoder is not None
+                    and self._lossless_encoder.returncode is None
+                ):
+                    try:
+                        await self._write_pcm(
+                            self._lossless_encoder,
+                            chunk,
+                            stall_limit,
+                            "FLAC encoder",
+                        )
+                    except RuntimeError as exc:
+                        self._recent_errors.append(str(exc)[-2000:])
+                        await self._stop_lossless_encoder()
                 bytes_written += len(chunk)
                 last_pcm_at = time.monotonic()
                 position = selection.offset_seconds + bytes_written / self._pcm_bytes_per_second
@@ -625,6 +969,24 @@ class ChannelSupervisor:
                 history_reason = "stopped"
             await self._stop_decoder()
             self._finish_history(history_reason)
+
+    @staticmethod
+    async def _write_pcm(
+        process: asyncio.subprocess.Process,
+        chunk: bytes,
+        timeout_seconds: float,
+        label: str,
+    ) -> None:
+        if process.returncode is not None or process.stdin is None:
+            raise RuntimeError(f"{label} stopped unexpectedly")
+        process.stdin.write(chunk)
+        try:
+            await asyncio.wait_for(
+                process.stdin.drain(),
+                timeout=timeout_seconds,
+            )
+        except (BrokenPipeError, ConnectionResetError, TimeoutError) as exc:
+            raise RuntimeError(f"{label} stopped accepting audio") from exc
 
     @property
     def _pcm_bytes_per_second(self) -> int:
@@ -688,6 +1050,69 @@ class ChannelSupervisor:
         )
         self._track_stderr(self._decoder, "decoder")
 
+    async def _ensure_lossless_encoder(self) -> None:
+        async with self._lossless_lock:
+            await self._ensure_lossless_encoder_locked()
+
+    async def _ensure_lossless_encoder_locked(self) -> None:
+        if self._lossless_encoder and self._lossless_encoder.returncode is None:
+            return
+        if self._lossless_encoder is not None:
+            await self._stop_lossless_encoder_locked()
+        binary = self.settings.ffmpeg.binary
+        if not binary.is_file():
+            raise FileNotFoundError(f"找不到 FFmpeg：{binary}")
+        output = self.settings.streaming.output
+        lossless = self.settings.player_api.lossless
+        command = [
+            str(binary),
+            "-hide_banner",
+            "-loglevel",
+            self.settings.ffmpeg.log_level,
+            "-nostats",
+            "-nostdin",
+            "-f",
+            "f32le",
+            "-ar",
+            str(output.sample_rate),
+            "-ac",
+            str(output.channels),
+            "-blocksize",
+            str(self._pcm_chunk_size),
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            lossless.codec,
+            "-compression_level",
+            str(lossless.compression_level),
+            "-sample_fmt",
+            f"s{lossless.sample_bits}",
+            "-ar",
+            str(lossless.sample_rate),
+            "-ac",
+            str(lossless.channels),
+            "-threads",
+            "1",
+            "-f",
+            "flac",
+            "pipe:1",
+        ]
+        self._lossless_encoder = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        self._track_stderr(self._lossless_encoder, "lossless-encoder")
+        self._track_output(
+            self._lossless_encoder,
+            self._lossless_fanout,
+            "flac",
+        )
+
     def _track_stderr(self, process: asyncio.subprocess.Process, label: str) -> None:
         async def drain() -> None:
             if not process.stderr:
@@ -700,6 +1125,32 @@ class ChannelSupervisor:
         task = asyncio.create_task(drain())
         self._stderr_tasks.add(task)
         task.add_done_callback(self._stderr_tasks.discard)
+
+    def _track_output(
+        self,
+        process: asyncio.subprocess.Process,
+        fanout: AudioFanout | FlacAudioFanout,
+        label: str,
+    ) -> None:
+        async def drain() -> None:
+            try:
+                if not process.stdout:
+                    return
+                while chunk := await process.stdout.read(4096):
+                    fanout.publish(chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recent_errors.append(f"{label}: {exc}"[-2000:])
+            finally:
+                fanout.close()
+
+        task = asyncio.create_task(
+            drain(),
+            name=f"radio-{label}-output-{self.channel_id}",
+        )
+        self._output_tasks.add(task)
+        task.add_done_callback(self._output_tasks.discard)
 
     async def _stop_decoder(self) -> None:
         process, self._decoder = self._decoder, None
@@ -719,8 +1170,13 @@ class ChannelSupervisor:
             await process.wait()
         self._close_process_transport(process)
 
-    async def _stop_encoder(self) -> None:
-        process, self._encoder = self._encoder, None
+    async def _stop_lossless_encoder(self) -> None:
+        async with self._lossless_lock:
+            await self._stop_lossless_encoder_locked()
+
+    async def _stop_lossless_encoder_locked(self) -> None:
+        process, self._lossless_encoder = self._lossless_encoder, None
+        self._lossless_demand_at = None
         if process is None:
             return
         if process.stdin:
@@ -747,6 +1203,38 @@ class ChannelSupervisor:
             with contextlib.suppress(BrokenPipeError, ConnectionResetError, TimeoutError):
                 await asyncio.wait_for(process.stdin.wait_closed(), timeout=1)
         self._close_process_transport(process)
+        self._lossless_fanout.close()
+
+    async def _stop_encoder(self) -> None:
+        process, self._encoder = self._encoder, None
+        self._encoder_ready.clear()
+        if process is None:
+            return
+        if process.stdin:
+            process.stdin.close()
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=self.settings.streaming.process_control.shutdown_timeout_seconds,
+                )
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=3)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(process.wait(), timeout=2)
+        else:
+            await process.wait()
+        if process.stdin:
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, TimeoutError):
+                await asyncio.wait_for(process.stdin.wait_closed(), timeout=1)
+        self._close_process_transport(process)
+        self._aac_fanout.close()
         with self.database.session_factory.begin() as db:
             state = db.scalar(
                 select(PlaybackState).where(PlaybackState.channel_id == self.channel_id)
@@ -765,6 +1253,17 @@ class ChannelSupervisor:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self._stderr_tasks.difference_update(done | pending)
+
+    async def _finish_output_tasks(self) -> None:
+        tasks = set(self._output_tasks)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=2)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._output_tasks.difference_update(done | pending)
 
     @staticmethod
     def _close_process_transport(process: asyncio.subprocess.Process) -> None:
@@ -864,6 +1363,7 @@ class ChannelSupervisor:
                 track.updated_at = utcnow()
 
     def _set_status(self, status: str, error: str | None = None) -> None:
+        now = utcnow()
         with self.database.session_factory.begin() as db:
             if db.get(Channel, self.channel_id) is None:
                 return
@@ -873,42 +1373,27 @@ class ChannelSupervisor:
             if state is None:
                 state = PlaybackState(channel_id=self.channel_id)
                 db.add(state)
+            if (
+                status == "idle"
+                and state.anchor_at is not None
+                and state.status in {"live", "starting", "degraded"}
+            ):
+                state.position_seconds = max(
+                    0,
+                    state.position_seconds
+                    + (now - aware_utc(state.anchor_at)).total_seconds(),
+                )
             state.status = status
             state.last_error = error
             state.ffmpeg_pid = self._encoder.pid if self._encoder else None
-            state.anchor_at = utcnow()
-            state.updated_at = utcnow()
+            state.anchor_at = now
+            state.updated_at = now
         self._publish_snapshot()
 
     def _publish_snapshot(self) -> None:
-        with self.database.session_factory() as db:
-            channel = db.get(Channel, self.channel_id)
-            if channel is None:
-                return
-            state = channel.playback_state
-            item = None
-            if state and state.current_item_id:
-                item = db.scalar(
-                    select(PlaylistItem)
-                    .options(joinedload(PlaylistItem.track))
-                    .where(PlaylistItem.id == state.current_item_id)
-                )
-            now = utcnow()
-            position = state.position_seconds if state else 0
-            if state and state.status == "live" and state.anchor_at:
-                position += max(0, (now - aware_utc(state.anchor_at)).total_seconds())
-            snapshot: dict[str, object] = {
-                "channel_id": self.channel_id,
-                "status": state.status if state else "starting",
-                "current_item_id": item.id if item else None,
-                "current_track": track_dict(item.track) if item else None,
-                "position_seconds": position,
-                "duration_seconds": item.track.duration_seconds if item else None,
-                "server_time": iso(now),
-                "started_at": iso(state.anchor_at) if state else None,
-                "last_error": state.last_error if state else None,
-                "ffmpeg_running": bool(self._encoder and self._encoder.returncode is None),
-                "restart_count": state.restart_count if state else 0,
-                "last_started_at": iso(state.last_started_at) if state else None,
-            }
-        self.manager.update_snapshot(self.channel_id, snapshot)
+        self.manager.publish_persisted_snapshot(
+            self.channel_id,
+            ffmpeg_running=bool(
+                self._encoder and self._encoder.returncode is None
+            ),
+        )

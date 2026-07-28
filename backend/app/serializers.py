@@ -97,7 +97,7 @@ def channel_dict(
         )
     now = utcnow()
     position = state.position_seconds if state else 0.0
-    if state and state.status == "live" and state.anchor_at:
+    if state and state.status in {"live", "idle"} and state.anchor_at:
         position += max(0.0, (now - aware_utc(state.anchor_at)).total_seconds())
     playback: dict[str, object] = {
         "channel_id": channel.id,

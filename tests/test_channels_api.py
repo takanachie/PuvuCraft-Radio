@@ -32,6 +32,13 @@ def _insert_track(client: TestClient, filename: str, digest: str) -> int:
         return track.id
 
 
+def _mark_hls_ready_without_ffmpeg(client: TestClient) -> None:
+    async def ready(channel_id: int) -> None:
+        assert channel_id == 1
+
+    client.app.state.playback.ensure_hls_stream = ready
+
+
 def test_channel_and_playlist_management(initialized_admin: TestClient) -> None:
     client = initialized_admin
     headers = csrf_headers(client)
@@ -153,6 +160,7 @@ def test_batch_add_playlist_items_is_ordered_and_skips_existing(
 
 def test_hls_is_protected_and_authorized_by_channel(initialized_admin: TestClient) -> None:
     client = initialized_admin
+    _mark_hls_ready_without_ffmpeg(client)
     with client.app.state.database.session_factory.begin() as db:
         channel = db.get(Channel, 1)
         assert channel is not None and channel.playback_state is not None
@@ -183,6 +191,7 @@ def test_hls_activity_is_exposed_as_current_listener_status(
     initialized_admin: TestClient,
 ) -> None:
     client = initialized_admin
+    _mark_hls_ready_without_ffmpeg(client)
     current_user = client.get("/api/auth/me").json()["user"]
     with client.app.state.database.session_factory.begin() as db:
         channel = db.get(Channel, 1)

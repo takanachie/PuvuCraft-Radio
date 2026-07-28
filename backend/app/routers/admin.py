@@ -202,6 +202,7 @@ def update_user(
     db.refresh(user)
     if payload.status != "approved":
         request.app.state.listeners.remove_user(user.id)
+        request.app.state.player_connections.revoke_user(user.id)
     return {"user": user_dict(user)}
 
 
@@ -239,6 +240,7 @@ def update_user_role(
     db.commit()
     db.refresh(user)
     request.app.state.listeners.remove_user(user.id)
+    request.app.state.player_connections.revoke_user(user.id)
     return {"user": user_dict(user)}
 
 
@@ -288,6 +290,7 @@ def delete_user(
     db.delete(user)
     db.commit()
     request.app.state.listeners.remove_user(user_id)
+    request.app.state.player_connections.revoke_user(user_id)
     request.app.state.uploads.refresh_snapshot()
 
 

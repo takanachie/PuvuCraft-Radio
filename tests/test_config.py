@@ -54,6 +54,24 @@ def test_listener_presence_timeout_has_a_safe_lower_bound(settings: Settings) ->
         Settings.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("connect_before_days", 31),
+        ("takeover_timeout_seconds", 9),
+    ],
+)
+def test_player_security_windows_are_fixed(
+    settings: Settings,
+    key: str,
+    value: int,
+) -> None:
+    payload = settings.model_dump()
+    payload["player_api"][key] = value
+    with pytest.raises(ValidationError):
+        Settings.model_validate(payload)
+
+
 def test_storage_location_ids_must_be_unique(settings: Settings) -> None:
     payload = settings.model_dump()
     payload["storage"]["locations"].append(payload["storage"]["locations"][0].copy())

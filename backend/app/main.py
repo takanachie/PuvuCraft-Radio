@@ -5,19 +5,23 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
 from .config import Settings, load_settings
 from .database import Database
 from .errors import install_error_handlers
-from .routers import admin, auth, channels, uploads
+from .routers import admin, auth, channels, player, uploads
 from .security import AuthService, BootstrapManager, RateLimiter
+from .services.audio_streams import PlayerConnectionRegistry
 from .services.listeners import ListenerRegistry
 from .services.media import MediaService
 from .services.playback import PlaybackManager
+from .services.player_tokens import PlayerTokenService
 from .services.storage import StorageManager
 from .services.uploads import UploadManager
+
+logger = logging.getLogger(__name__)
 
 
 def configure_logging(settings: Settings) -> None:
@@ -57,6 +61,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     storage = StorageManager(settings)
     media = MediaService(settings, storage)
     listeners = ListenerRegistry(settings.stream_access.listener_timeout_seconds)
+    player_tokens = PlayerTokenService(settings)
+    player_connections = PlayerConnectionRegistry(
+        settings.stream_access.max_listeners,
+        settings.player_api.takeover_timeout_seconds,
+    )
     playback = PlaybackManager(settings, database, storage, listeners)
     upload_manager = UploadManager(database, media, storage)
 
@@ -74,11 +83,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with database.session_factory.begin() as db:
             auth_service.cleanup_sessions(db)
         bootstrap.synchronize(database.has_admin())
+        await player_connections.start()
         await upload_manager.start()
         await playback.start()
         try:
             yield
         finally:
+            await player_connections.stop()
             await playback.stop()
             await upload_manager.stop()
             database.close()
@@ -99,18 +110,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.storage = storage
     app.state.media = media
     app.state.listeners = listeners
+    app.state.player_tokens = player_tokens
+    app.state.player_connections = player_connections
     app.state.playback = playback
     app.state.uploads = upload_manager
 
     install_error_handlers(app)
     app.include_router(auth.router)
     app.include_router(channels.router)
+    app.include_router(player.router)
     app.include_router(admin.router)
     app.include_router(uploads.router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        response = await call_next(request)
+        player_path = request.url.path == "/listen" or request.url.path.startswith(
+            "/listen/"
+        )
+        if player_path and request.method != "GET":
+            return Response(
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            response = await call_next(request)
+        except Exception:
+            if not player_path:
+                raise
+            logger.exception("external player request failed")
+            response = Response(
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        if player_path and response.status_code == 404:
+            response = Response(
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "same-origin")
@@ -126,7 +162,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/{spa_path:path}", include_in_schema=False)
     def frontend_fallback(spa_path: str):
-        if spa_path.startswith(("api/", "hls/")):
+        reserved_roots = ("api", "hls", "listen")
+        if spa_path in reserved_roots or spa_path.startswith(
+            tuple(f"{root}/" for root in reserved_roots)
+        ):
             return JSONResponse(
                 status_code=404,
                 content={"code": "not_found", "message": "资源不存在"},

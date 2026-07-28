@@ -54,6 +54,11 @@ class LoginInput(ApiModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+class PlayerUrlInput(ApiModel):
+    channel_id: int = Field(gt=0)
+    stream_format: Literal["aac", "flac"] = "aac"
+
+
 class UserUpdate(ApiModel):
     status: Literal["pending", "approved", "rejected", "disabled"]
 

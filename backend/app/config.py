@@ -196,7 +196,7 @@ class FfmpegConfig(StrictModel):
 class StreamOutputConfig(StrictModel):
     codec: Literal["aac"] = "aac"
     profile: str = "aac_low"
-    bitrate: str = "192k"
+    bitrate: str = "320k"
     sample_rate: int = Field(default=48000, ge=8000)
     channels: int = Field(default=2, ge=1, le=8)
     sample_bits: Literal[32] = 32
@@ -204,8 +204,8 @@ class StreamOutputConfig(StrictModel):
 
 class HlsConfig(StrictModel):
     segment_container: Literal["mpegts"] = "mpegts"
-    segment_duration_seconds: int = Field(default=4, ge=1)
-    playlist_segments: int = Field(default=6, ge=3)
+    segment_duration_seconds: int = Field(default=2, ge=1)
+    playlist_segments: int = Field(default=3, ge=3)
     delete_old_segments: bool = True
     delete_threshold: int = Field(default=2, ge=1)
 
@@ -225,7 +225,8 @@ class ProcessControlConfig(StrictModel):
 
 
 class StreamingConfig(StrictModel):
-    always_on: bool = True
+    always_on: bool = False
+    idle_shutdown_seconds: int = Field(default=30, ge=5, le=300)
     require_authenticated_session: bool = True
     output: StreamOutputConfig
     hls: HlsConfig
@@ -236,8 +237,26 @@ class StreamingConfig(StrictModel):
 class StreamAccessConfig(StrictModel):
     nginx_auth_request_path: str
     authorization_cache_seconds: int = Field(default=5, ge=0)
-    listener_timeout_seconds: int = Field(default=20, ge=5, le=300)
+    listener_timeout_seconds: int = Field(default=10, ge=5, le=300)
+    max_listeners: int = Field(default=50, ge=1, le=1000)
     allow_anonymous: bool = False
+
+
+class LosslessStreamConfig(StrictModel):
+    codec: Literal["flac"] = "flac"
+    sample_rate: Literal[44100] = 44100
+    channels: Literal[2] = 2
+    sample_bits: Literal[16] = 16
+    compression_level: int = Field(default=5, ge=0, le=12)
+
+
+class PlayerApiConfig(StrictModel):
+    title: Literal["PuvuFM"] = "PuvuFM"
+    connect_before_days: Literal[30] = 30
+    queue_seconds: float = Field(default=5, ge=1, le=10)
+    takeover_timeout_seconds: Literal[10] = 10
+    startup_timeout_seconds: int = Field(default=10, ge=3, le=30)
+    lossless: LosslessStreamConfig = Field(default_factory=LosslessStreamConfig)
 
 
 class EventsConfig(StrictModel):
@@ -296,6 +315,7 @@ class Settings(StrictModel):
     ffmpeg: FfmpegConfig
     streaming: StreamingConfig
     stream_access: StreamAccessConfig
+    player_api: PlayerApiConfig = Field(default_factory=PlayerApiConfig)
     events: EventsConfig
     frontend: FrontendConfig
     seed: SeedConfig

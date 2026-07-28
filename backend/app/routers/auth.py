@@ -18,6 +18,7 @@ from ..security import (
     token_hash,
 )
 from ..serializers import user_dict
+from ..services.player_tokens import initialize_player_credential
 
 router = APIRouter(prefix="/api")
 
@@ -85,6 +86,7 @@ def create_first_admin(
             created_at=now,
             updated_at=now,
         )
+        initialize_player_credential(user, now)
         db.add(user)
         try:
             db.commit()
@@ -127,6 +129,7 @@ def register(
         created_at=now,
         updated_at=now,
     )
+    initialize_player_credential(user, now)
     db.add(user)
     try:
         db.commit()

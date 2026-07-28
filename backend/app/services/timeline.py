@@ -153,7 +153,7 @@ def recover_timeline(
         offset = 0.0
     else:
         offset = max(0.0, state.position_seconds)
-        if state.status in {"live", "starting", "degraded", "offline"} and state.anchor_at:
+        if state.status in {"live", "idle", "starting", "degraded", "offline"} and state.anchor_at:
             offset += max(0.0, (now - aware_utc(state.anchor_at)).total_seconds())
 
     cycle_duration = sum(item.track.duration_seconds for item in available)

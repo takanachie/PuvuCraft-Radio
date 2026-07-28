@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -43,6 +44,8 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    player_key_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    player_key_generation: Mapped[bytes | None] = mapped_column(LargeBinary(16))
 
     sessions: Mapped[list[LoginSession]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -98,7 +101,7 @@ class MusicLibrary(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    tracks: Mapped[list["Track"]] = relationship(
+    tracks: Mapped[list[Track]] = relationship(
         back_populates="library",
         passive_updates=True,
     )
@@ -143,7 +146,7 @@ class Track(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     playlist_items: Mapped[list[PlaylistItem]] = relationship(back_populates="track")
-    library: Mapped["MusicLibrary"] = relationship(
+    library: Mapped[MusicLibrary] = relationship(
         back_populates="tracks",
         passive_updates=True,
     )

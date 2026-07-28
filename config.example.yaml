@@ -113,19 +113,20 @@ ffmpeg:
     max_failures_before_offline: 10
 
 streaming:
-  always_on: true
+  always_on: false
+  idle_shutdown_seconds: 30
   require_authenticated_session: true
   output:
     codec: "aac"
     profile: "aac_low"
-    bitrate: "192k"
+    bitrate: "320k"
     sample_rate: 48000
     channels: 2
     sample_bits: 32
   hls:
     segment_container: "mpegts"
-    segment_duration_seconds: 4
-    playlist_segments: 6
+    segment_duration_seconds: 2
+    playlist_segments: 3
     delete_old_segments: true
     delete_threshold: 2
   playback:
@@ -144,8 +145,22 @@ streaming:
 stream_access:
   nginx_auth_request_path: "/api/internal/stream-auth"
   authorization_cache_seconds: 5
-  listener_timeout_seconds: 20
+  listener_timeout_seconds: 10
+  max_listeners: 50
   allow_anonymous: false
+
+player_api:
+  title: "PuvuFM"
+  connect_before_days: 30
+  queue_seconds: 5
+  takeover_timeout_seconds: 10
+  startup_timeout_seconds: 10
+  lossless:
+    codec: "flac"
+    sample_rate: 44100
+    channels: 2
+    sample_bits: 16
+    compression_level: 5
 
 events:
   transport: "sse"
