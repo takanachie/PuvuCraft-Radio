@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from backend.app.models import AuditEvent, Channel, User
+from backend.app.models import AuditEvent, Channel, LoginSession, User
 
 from .conftest import csrf_headers
 
@@ -68,6 +69,22 @@ def test_registration_approval_and_session_revocation(
             json={"username": "listener", "password": "listener-password"},
         )
         assert login.status_code == 200
+        active_at = datetime(2026, 7, 30, 1, 2, 3, tzinfo=UTC)
+        with admin.app.state.database.session_factory.begin() as db:
+            user = db.get(User, user_id)
+            login_session = db.scalar(
+                select(LoginSession).where(LoginSession.user_id == user_id)
+            )
+            assert user is not None and login_session is not None
+            user.last_login_at = active_at - timedelta(hours=1)
+            login_session.last_seen_at = active_at
+        listed_user = next(
+            user
+            for user in admin.get("/api/admin/users").json()
+            if user["id"] == user_id
+        )
+        assert listed_user["last_active_at"] == "2026-07-30T01:02:03Z"
+        assert listed_user["last_active_at"] != listed_user["last_login_at"]
         assert listener.get("/api/channels").status_code == 200
         assert listener.get("/api/admin/users").status_code == 403
         assert listener.get("/api/admin/listeners").status_code == 403

@@ -17,6 +17,7 @@ from ..errors import ApiError
 from ..models import (
     AuditEvent,
     Channel,
+    LoginSession,
     MusicLibrary,
     PlaybackState,
     PlaylistItem,
@@ -135,11 +136,21 @@ def list_users(
     _admin: User = Depends(require_admin_read),
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    users = db.scalars(select(User).order_by(User.created_at.desc())).all()
+    latest_activity = (
+        select(func.max(LoginSession.last_seen_at))
+        .where(LoginSession.user_id == User.id)
+        .correlate(User)
+        .scalar_subquery()
+    )
+    users = db.execute(
+        select(User, latest_activity.label("last_active_at"))
+        .order_by(User.created_at.desc())
+    ).all()
     listening_states = current_listener_states(request, db)
     result: list[dict[str, object]] = []
-    for user in users:
+    for user, last_active_at in users:
         serialized = user_dict(user)
+        serialized["last_active_at"] = iso(last_active_at)
         serialized["listening"] = listening_states.get(user.id, offline_listener_state())
         result.append(serialized)
     return result

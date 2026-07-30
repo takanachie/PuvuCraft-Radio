@@ -80,6 +80,7 @@ async function refreshListening() {
     const byUserId = new Map(active.map((item) => [String(item.user_id), item]))
     for (const user of users.value) {
       const listening = byUserId.get(String(user.id))
+      if (listening?.last_seen_at) user.last_active_at = listening.last_seen_at
       user.listening = listening
         ? {
             online: listening.online,
@@ -218,7 +219,7 @@ onBeforeUnmount(() => {
     <div class="data-frame">
       <table class="console-table user-table">
         <thead>
-          <tr><th>用户</th><th>角色</th><th>账号状态</th><th>收听状态</th><th>申请时间</th><th>最近登录</th><th class="align-right">操作</th></tr>
+          <tr><th>用户</th><th>角色</th><th>账号状态</th><th>收听状态</th><th>申请时间</th><th>最近活跃</th><th class="align-right">操作</th></tr>
         </thead>
         <tbody>
           <tr v-if="loading"><td colspan="7" class="table-message">正在读取账号总线…</td></tr>
@@ -241,7 +242,7 @@ onBeforeUnmount(() => {
                 </small>
               </td>
               <td data-label="申请时间">{{ formatDateTime(user.created_at) }}</td>
-              <td data-label="最近登录">{{ formatDateTime(user.last_login_at) }}</td>
+              <td data-label="最近活跃">{{ formatDateTime(user.last_active_at) }}</td>
               <td data-label="操作" class="table-actions">
                 <template v-if="effectiveStatus(user) === 'pending'">
                   <button class="button button--positive button--small" type="button" :disabled="busyId !== null" @click="setStatus(user, 'approved')">批准</button>

@@ -93,6 +93,7 @@ export interface User {
   updated_at?: string
   approved_at?: string | null
   last_login_at?: string | null
+  last_active_at?: string | null
   listening?: ListeningState
 }
 
