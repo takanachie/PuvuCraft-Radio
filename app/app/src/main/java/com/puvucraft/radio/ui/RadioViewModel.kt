@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.puvucraft.radio.BuildConfig
 import com.puvucraft.radio.PlayerStreamFormat
 import com.puvucraft.radio.data.ApiException
+import com.puvucraft.radio.data.DEFAULT_RADIO_SERVER_URL
 import com.puvucraft.radio.data.EncryptedSessionStore
 import com.puvucraft.radio.data.RadioApiClient
 import com.puvucraft.radio.data.RadioChannel
@@ -100,7 +101,7 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
 
             val client = try {
                 RadioApiClient.create(
-                    rawBaseUrl = DEFAULT_SERVER_URL,
+                    rawBaseUrl = DEFAULT_RADIO_SERVER_URL,
                     allowCleartext = BuildConfig.DEBUG,
                     sessionStore = sessionStore,
                 )
@@ -424,7 +425,7 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val client = try {
                 RadioApiClient.create(
-                    rawBaseUrl = DEFAULT_SERVER_URL,
+                    rawBaseUrl = DEFAULT_RADIO_SERVER_URL,
                     allowCleartext = BuildConfig.DEBUG,
                     sessionStore = sessionStore,
                     restoreSession = true,
@@ -521,7 +522,6 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
-        private const val DEFAULT_SERVER_URL = "https://www.phi-s.tech"
         private const val SERVER_URL_KEY = "server_url"
         private const val STREAM_FORMAT_KEY = "stream_format"
         private val PLAYER_KEY_RENEWAL_CODES = setOf(

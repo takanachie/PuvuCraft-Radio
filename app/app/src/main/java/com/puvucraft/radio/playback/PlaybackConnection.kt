@@ -32,12 +32,13 @@ data class PlaybackUiState(
     val streamFormat: PlayerStreamFormat? = null,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
-    val volume: Float = 0.78f,
+    val volumeLevel: Float = LogarithmicVolume.DEFAULT_LEVEL,
     val error: String? = null,
 )
 
 class PlaybackConnection(context: Context) {
     private val appContext = context.applicationContext
+    private val volumeStore = PlaybackVolumeStore(appContext)
     private val mainExecutor = ContextCompat.getMainExecutor(appContext)
     private val sessionToken = SessionToken(
         appContext,
@@ -46,7 +47,9 @@ class PlaybackConnection(context: Context) {
     private val controllerFuture = MediaController.Builder(appContext, sessionToken)
         .buildAsync()
 
-    private val _state = MutableStateFlow(PlaybackUiState())
+    private val _state = MutableStateFlow(
+        PlaybackUiState(volumeLevel = volumeStore.readLevel()),
+    )
     val state: StateFlow<PlaybackUiState> = _state.asStateFlow()
 
     private var controller: MediaController? = null
@@ -129,17 +132,22 @@ class PlaybackConnection(context: Context) {
         }
     }
 
-    fun setVolume(volume: Float) {
+    fun setVolume(volumeLevel: Float) {
         mainExecutor.execute {
-            val safeVolume = volume.coerceIn(0f, 1f)
-            controller?.volume = safeVolume
-            _state.value = _state.value.copy(volume = safeVolume)
+            val safeLevel = LogarithmicVolume.normalizeLevel(volumeLevel)
+            volumeStore.saveLevel(safeLevel)
+            controller?.volume = LogarithmicVolume.levelToPlayerGain(safeLevel)
+            _state.value = _state.value.copy(volumeLevel = safeLevel)
         }
     }
 
     fun toggleMute() {
-        val nextVolume = if (_state.value.volume > 0f) 0f else 0.78f
-        setVolume(nextVolume)
+        val nextLevel = if (_state.value.volumeLevel > 0f) {
+            0f
+        } else {
+            volumeStore.readLastAudibleLevel()
+        }
+        setVolume(nextLevel)
     }
 
     fun stopAndClear() {
@@ -151,7 +159,9 @@ class PlaybackConnection(context: Context) {
                 updateState(this)
             }
             if (controller == null) {
-                _state.value = PlaybackUiState()
+                _state.value = PlaybackUiState(
+                    volumeLevel = volumeStore.readLevel(),
+                )
             }
         }
     }
@@ -208,7 +218,7 @@ class PlaybackConnection(context: Context) {
             ),
             isPlaying = player.isPlaying,
             isBuffering = player.playbackState == Player.STATE_BUFFERING,
-            volume = player.volume,
+            volumeLevel = LogarithmicVolume.playerGainToLevel(player.volume),
             error = player.playerError?.let { "直播信号中断，可点击重新连接" },
         )
     }

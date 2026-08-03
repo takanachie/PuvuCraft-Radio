@@ -230,9 +230,13 @@ class RadioApiClient private constructor(
             allowCleartext: Boolean,
             sessionStore: EncryptedSessionStore? = null,
             restoreSession: Boolean = false,
+            persistSessionChanges: Boolean = true,
         ): RadioApiClient {
             val baseUrl = ServerUrl.normalize(rawBaseUrl, allowCleartext)
-            return RadioApiClient(baseUrl, sessionStore).also { client ->
+            return RadioApiClient(
+                baseUrl = baseUrl,
+                sessionStore = sessionStore.takeIf { persistSessionChanges },
+            ).also { client ->
                 if (restoreSession) {
                     val cookieUri = TlsCompatibility.networkUri(URI.create(baseUrl))
                     sessionStore?.restore(baseUrl)?.forEach {

@@ -80,6 +80,7 @@ import com.puvucraft.radio.data.TrackSummary
 import com.puvucraft.radio.playback.PlaybackUiState
 import kotlin.math.cos
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 @Composable
@@ -1138,7 +1139,7 @@ private fun TransportDeck(
             enabled = playbackState.controllerReady,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text(if (playbackState.volume <= 0f) "取消静音" else "静音")
+            Text(if (playbackState.volumeLevel <= 0f) "取消静音" else "静音")
         }
 
         Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -1148,13 +1149,13 @@ private fun TransportDeck(
             ) {
                 Text("VOLUME", style = MaterialTheme.typography.labelSmall, color = Dim)
                 Text(
-                    "${(playbackState.volume * 100).toInt()}",
+                    "${(playbackState.volumeLevel * 100).roundToInt()}%",
                     style = MaterialTheme.typography.labelSmall,
                     color = Paper,
                 )
             }
             Slider(
-                value = playbackState.volume,
+                value = playbackState.volumeLevel,
                 onValueChange = onVolumeChange,
                 enabled = playbackState.controllerReady,
                 colors = SliderDefaults.colors(
@@ -1639,7 +1640,7 @@ private fun ListenerTabletPreview() {
             channelName = "Puvu FM",
             streamFormat = PlayerStreamFormat.FLAC,
             isPlaying = true,
-            volume = 0.78f,
+            volumeLevel = 0.78f,
         ),
         onUsernameChange = {},
         onPasswordChange = {},

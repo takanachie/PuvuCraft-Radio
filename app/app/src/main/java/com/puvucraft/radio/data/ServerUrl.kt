@@ -2,6 +2,8 @@ package com.puvucraft.radio.data
 
 import java.net.URI
 
+const val DEFAULT_RADIO_SERVER_URL = "https://www.phi-s.tech"
+
 object ServerUrl {
     fun normalize(rawValue: String, allowCleartext: Boolean): String {
         val raw = rawValue.trim()
