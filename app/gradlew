@@ -1,0 +1,34 @@
+#!/bin/sh
+
+# Minimal Gradle wrapper launcher. The wrapper JAR and distribution version are
+# pinned in gradle/wrapper so builds do not depend on a system Gradle install.
+
+APP_PATH=$0
+while [ -h "$APP_PATH" ]; do
+    APP_DIR=$(cd -P "$(dirname "$APP_PATH")" >/dev/null 2>&1 && pwd)
+    APP_PATH=$(readlink "$APP_PATH")
+    case "$APP_PATH" in
+        /*) ;;
+        *) APP_PATH=$APP_DIR/$APP_PATH ;;
+    esac
+done
+
+APP_HOME=$(cd -P "$(dirname "$APP_PATH")" >/dev/null 2>&1 && pwd)
+CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
+
+if [ -n "$JAVA_HOME" ]; then
+    JAVACMD=$JAVA_HOME/bin/java
+else
+    JAVACMD=java
+fi
+
+if [ ! -x "$JAVACMD" ] && ! command -v "$JAVACMD" >/dev/null 2>&1; then
+    echo "Java 17 was not found. Set JAVA_HOME or install the JDK bundled with Android Studio." >&2
+    exit 1
+fi
+
+exec "$JAVACMD" \
+    "-Dorg.gradle.appname=gradlew" \
+    -classpath "$CLASSPATH" \
+    org.gradle.wrapper.GradleWrapperMain \
+    "$@"

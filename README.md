@@ -16,6 +16,7 @@ PuvuCraft Radio 是基于 FastAPI、Vue 3、FFmpeg 和 HLS 的多频道同步在
 - 每频道按需共享的 320 kbps AAC/HLS 编码器、持续逻辑时间线、切歌和重启恢复
 - 带 30 天连接窗口、单连接接管和空 404 防泄露的外部播放器持续流；管理员可选 FLAC
 - Vue 3 深色电台控制台、hls.js 播放器和 SSE 状态更新
+- Android 9+ 原生 Kotlin 客户端，支持登录、自适应频道界面、AAC/管理员 FLAC 与后台收听
 - Nginx `auth_request`、HTTPS 和 systemd 部署模板
 
 ## 开发环境
@@ -49,6 +50,10 @@ cd frontend && npm test && npm run build
 ```
 
 本地缺少 FFmpeg 时，账号和管理 API 仍可启动，但频道会显示 `offline` 并报告 FFmpeg 不可用。
+
+## Android 客户端
+
+Android 客户端代码位于 [`app/`](app/)，只提供登录和收听功能。它支持 Android 9（API 28）及以上系统，构建、屏幕适配与安全说明见 [`app/README.md`](app/README.md)。
 
 ## 生产部署
 

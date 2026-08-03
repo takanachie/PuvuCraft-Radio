@@ -12,8 +12,8 @@ dist/
 
 config.yaml
 .env
-data/
-tmp/
+/data/
+/tmp/
 
 frontend/node_modules/
 frontend/dist/
