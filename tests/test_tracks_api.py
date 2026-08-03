@@ -71,6 +71,25 @@ def test_track_query_combines_library_search_and_fixed_database_page(
     assert all(track["library_group"] == "default" for track in payload["items"])
     assert all("needle" in track["title"].lower() for track in payload["items"])
     assert payload["library_groups"] == ["default", "archive"]
+    assert "matching_ids" not in payload
+
+    all_matches = client.get(
+        "/api/admin/tracks",
+        params={
+            "library_group": "default",
+            "search": "needle",
+            "page": 1,
+            "include_matching_ids": True,
+        },
+    )
+    assert all_matches.status_code == 200
+    all_matches_payload = all_matches.json()
+    assert len(all_matches_payload["items"]) == 10
+    assert len(all_matches_payload["matching_ids"]) == 12
+    assert set(all_matches_payload["matching_ids"]) == set(default_ids)
+    assert all_matches_payload["matching_ids"][:10] == [
+        track["id"] for track in all_matches_payload["items"]
+    ]
 
     second_page = client.get(
         "/api/admin/tracks",

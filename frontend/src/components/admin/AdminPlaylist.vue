@@ -21,6 +21,7 @@ const highlightedAddTrackIndex = ref(-1)
 const batchAddOpen = ref(false)
 const batchAddQuery = ref('')
 const batchAddTrackIds = ref<Set<string>>(new Set())
+const batchFilteredTrackIds = ref<string[] | null>(null)
 const batchAddError = ref('')
 const batchAddSearchInput = ref<HTMLInputElement | null>(null)
 const candidateLoading = ref(false)
@@ -57,9 +58,10 @@ const addableTracks = computed(() =>
 const filteredAddableTracks = computed(() => addableTracks.value)
 const filteredBatchAddTracks = computed(() => addableTracks.value)
 const allFilteredBatchTracksSelected = computed(() =>
-  filteredBatchAddTracks.value.length > 0
-  && filteredBatchAddTracks.value.every(
-    (track) => batchAddTrackIds.value.has(String(track.id)),
+  batchFilteredTrackIds.value !== null
+  && batchFilteredTrackIds.value.length > 0
+  && batchFilteredTrackIds.value.every(
+    (trackId) => batchAddTrackIds.value.has(trackId),
   ),
 )
 const highlightedAddTrackOptionId = computed(() =>
@@ -132,6 +134,7 @@ async function loadTrackCandidates(
   const channel = currentChannel.value
   if (!channel) {
     tracks.value = []
+    batchFilteredTrackIds.value = null
     candidatePage.value = 1
     candidateTotalPages.value = 1
     candidateTotal.value = 0
@@ -142,6 +145,8 @@ async function loadTrackCandidates(
   const requestId = ++candidateRequest
   const channelId = String(channel.id)
   const requestedLibrary = libraryGroup.value
+  const requestedForBatch = batchAddOpen.value
+  if (requestedForBatch) batchFilteredTrackIds.value = null
   candidateLoading.value = true
   try {
     const result = await api.admin.tracks({
@@ -150,6 +155,7 @@ async function loadTrackCandidates(
       search: query,
       availableOnly: true,
       excludeChannelId: channel.id,
+      includeMatchingIds: requestedForBatch,
     })
     if (
       requestId !== candidateRequest
@@ -161,6 +167,9 @@ async function loadTrackCandidates(
     candidateTotalPages.value = result.total_pages
     candidateTotal.value = result.total
     libraryGroups.value = result.library_groups
+    if (requestedForBatch && batchAddOpen.value) {
+      batchFilteredTrackIds.value = (result.matching_ids || []).map(String)
+    }
   } catch (cause) {
     if (requestId !== candidateRequest || !reportError) return
     if (batchAddOpen.value) {
@@ -279,6 +288,7 @@ function changeCandidateLibrary() {
   addTrackQuery.value = ''
   batchAddQuery.value = ''
   batchAddTrackIds.value = new Set()
+  batchFilteredTrackIds.value = null
   highlightedAddTrackIndex.value = -1
   tracks.value = []
   candidatePage.value = 1
@@ -326,6 +336,7 @@ function filterAddTracks() {
 
 function filterBatchTracks() {
   batchAddError.value = ''
+  batchFilteredTrackIds.value = null
   scheduleCandidateSearch(batchAddQuery.value)
 }
 
@@ -378,6 +389,7 @@ function resetBatchAdd() {
   batchAddOpen.value = false
   batchAddQuery.value = ''
   batchAddTrackIds.value = new Set()
+  batchFilteredTrackIds.value = null
   batchAddError.value = ''
 }
 
@@ -386,6 +398,7 @@ function openBatchAdd() {
   resetAddTrackSelection()
   batchAddQuery.value = ''
   batchAddTrackIds.value = new Set()
+  batchFilteredTrackIds.value = null
   batchAddOpen.value = true
   tracks.value = []
   candidatePage.value = 1
@@ -415,11 +428,13 @@ function toggleBatchTrack(track: Track) {
 }
 
 function toggleFilteredBatchTracks() {
+  const filteredTrackIds = batchFilteredTrackIds.value
+  if (!filteredTrackIds?.length) return
   const selected = new Set(batchAddTrackIds.value)
   if (allFilteredBatchTracksSelected.value) {
-    for (const track of filteredBatchAddTracks.value) selected.delete(String(track.id))
+    for (const trackId of filteredTrackIds) selected.delete(trackId)
   } else {
-    for (const track of filteredBatchAddTracks.value) selected.add(String(track.id))
+    for (const trackId of filteredTrackIds) selected.add(trackId)
   }
   batchAddTrackIds.value = selected
   batchAddError.value = ''
@@ -814,10 +829,10 @@ onBeforeUnmount(() => {
               <button
                 class="text-button"
                 type="button"
-                :disabled="!filteredBatchAddTracks.length"
+                :disabled="candidateLoading || !batchFilteredTrackIds?.length"
                 @click="toggleFilteredBatchTracks"
               >
-                {{ allFilteredBatchTracksSelected ? '取消当前页' : '全选当前页' }}
+                {{ allFilteredBatchTracksSelected ? '取消筛选结果' : `全选筛选结果（${candidateTotal}）` }}
               </button>
               <button
                 class="text-button"

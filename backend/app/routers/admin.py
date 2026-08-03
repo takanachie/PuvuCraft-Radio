@@ -603,6 +603,7 @@ def list_tracks(
     search: str = Query(default="", max_length=512),
     available_only: bool = Query(default=False),
     exclude_channel_id: int | None = Query(default=None, ge=1),
+    include_matching_ids: bool = Query(default=False),
     _admin: User = Depends(require_admin_read),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
@@ -656,7 +657,7 @@ def list_tracks(
         )
         or 0
     )
-    return {
+    response: dict[str, object] = {
         "items": [_track_with_references(track) for track in tracks],
         "page": resolved_page,
         "page_size": TRACK_LIBRARY_PAGE_SIZE,
@@ -667,6 +668,15 @@ def list_tracks(
         "available_count": available_count,
         "unavailable_count": library_total - available_count,
     }
+    if include_matching_ids:
+        response["matching_ids"] = list(
+            db.scalars(
+                select(Track.id)
+                .where(*filters)
+                .order_by(Track.created_at.desc(), Track.id.desc())
+            ).all()
+        )
+    return response
 
 
 @router.post("/tracks/scan")

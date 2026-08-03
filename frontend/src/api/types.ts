@@ -126,6 +126,7 @@ export interface Track extends TrackSummary {
 
 export interface TrackPage {
   items: Track[]
+  matching_ids?: EntityId[]
   page: number
   page_size: number
   total: number
@@ -142,6 +143,7 @@ export interface TrackQuery {
   search?: string
   availableOnly?: boolean
   excludeChannelId?: EntityId
+  includeMatchingIds?: boolean
 }
 
 export interface TrackLibraryMoveResponse {

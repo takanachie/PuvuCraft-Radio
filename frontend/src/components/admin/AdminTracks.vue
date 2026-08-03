@@ -56,6 +56,8 @@ interface SubmittedUploadTask {
   similarities: SimilarTrackCandidate[]
 }
 
+type UploadReviewFilter = 'all' | 'similar' | 'unconfirmed'
+
 function createUploadClientId(): string {
   const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
@@ -92,6 +94,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const directoryInput = ref<HTMLInputElement | null>(null)
 const uploadReviewOpen = ref(false)
 const uploadReviewQuery = ref('')
+const uploadReviewFilter = ref<UploadReviewFilter>('all')
 const uploadReviewError = ref('')
 const uploadReviewNotice = ref('')
 const submittedQueueError = ref('')
@@ -156,10 +159,26 @@ const submittedUploadBytes = computed(() =>
 const invalidPendingCount = computed(() =>
   selectedFiles.value.filter((file) => Boolean(pendingFileIssue(file))).length,
 )
+const similarPendingFiles = computed(() =>
+  selectedFiles.value.filter((file) => pendingFileSimilarities(file).length > 0),
+)
+const unconfirmedSimilarFiles = computed(() =>
+  similarPendingFiles.value.filter(
+    (file) => !confirmedSimilarFiles.value.has(pendingFileKey(file)),
+  ),
+)
+const similarPendingCount = computed(() => similarPendingFiles.value.length)
+const unconfirmedSimilarCount = computed(() => unconfirmedSimilarFiles.value.length)
 const filteredPendingFiles = computed(() => {
+  let files = selectedFiles.value
+  if (uploadReviewFilter.value === 'similar') {
+    files = similarPendingFiles.value
+  } else if (uploadReviewFilter.value === 'unconfirmed') {
+    files = unconfirmedSimilarFiles.value
+  }
   const needle = uploadReviewQuery.value.trim().toLocaleLowerCase()
-  if (!needle) return selectedFiles.value
-  return selectedFiles.value.filter((file) => {
+  if (!needle) return files
+  return files.filter((file) => {
     const candidates = pendingFileSimilarities(file)
     return [
       pendingFilePath(file),
@@ -173,15 +192,6 @@ const filteredPendingFiles = computed(() => {
     ].some((value) => value?.toLocaleLowerCase().includes(needle))
   })
 })
-const similarPendingCount = computed(() =>
-  selectedFiles.value.filter((file) => pendingFileSimilarities(file).length > 0).length,
-)
-const unconfirmedSimilarCount = computed(() =>
-  selectedFiles.value.filter((file) => {
-    const key = pendingFileKey(file)
-    return pendingFileSimilarities(file).length > 0 && !confirmedSimilarFiles.value.has(key)
-  }).length,
-)
 
 function clearMessages() {
   error.value = ''
@@ -612,7 +622,10 @@ function chooseDirectory(event: Event) {
 
 function openUploadReview() {
   if (!selectedFiles.value.length) return
-  if (!uploadReviewOpen.value) uploadReviewQuery.value = ''
+  if (!uploadReviewOpen.value) {
+    uploadReviewQuery.value = ''
+    uploadReviewFilter.value = 'all'
+  }
   uploadReviewOpen.value = true
   void nextTick(() => uploadReviewSearchInput.value?.focus())
   void preflightPendingFiles()
@@ -632,23 +645,33 @@ function clearPendingFiles() {
   uploadReviewError.value = ''
   uploadReviewNotice.value = ''
   uploadReviewQuery.value = ''
+  uploadReviewFilter.value = 'all'
   if (fileInput.value) fileInput.value.value = ''
   if (directoryInput.value) directoryInput.value.value = ''
   uploadReviewOpen.value = false
 }
 
-function removePendingFile(file: File) {
-  if (committing.value) return
-  const key = pendingFileKey(file)
-  selectedFiles.value = selectedFiles.value.filter((candidate) => candidate !== file)
+function removePendingFiles(files: File[]): number {
+  if (committing.value || !files.length) return 0
+  const keys = new Set(files.map(pendingFileKey))
+  preflightRequest += 1
+  preflighting.value = false
+  selectedFiles.value = selectedFiles.value.filter(
+    (candidate) => !keys.has(pendingFileKey(candidate)),
+  )
   const nextSimilarities = { ...similaritiesByFile.value }
-  delete nextSimilarities[key]
+  for (const key of keys) delete nextSimilarities[key]
   similaritiesByFile.value = nextSimilarities
   const confirmed = new Set(confirmedSimilarFiles.value)
-  confirmed.delete(key)
+  for (const key of keys) confirmed.delete(key)
   confirmedSimilarFiles.value = confirmed
   uploadReviewError.value = ''
   if (!selectedFiles.value.length) clearPendingFiles()
+  return keys.size
+}
+
+function removePendingFile(file: File) {
+  removePendingFiles([file])
 }
 
 function setSimilarityConfirmation(file: File, confirmed: boolean) {
@@ -662,6 +685,41 @@ function setSimilarityConfirmation(file: File, confirmed: boolean) {
 
 function changeSimilarityConfirmation(file: File, event: Event) {
   setSimilarityConfirmation(file, (event.target as HTMLInputElement).checked)
+}
+
+function confirmUnconfirmedSimilarFiles() {
+  const files = [...unconfirmedSimilarFiles.value]
+  if (
+    committing.value
+    || preflighting.value
+    || !files.length
+    || !window.confirm(
+      `批量确认 ${files.length} 个名称相似文件仍继续上传？提交前会再次检查，SHA-256 完全重复仍会自动驳回。`,
+    )
+  ) return
+
+  const confirmed = new Set(confirmedSimilarFiles.value)
+  for (const file of files) confirmed.add(pendingFileKey(file))
+  confirmedSimilarFiles.value = confirmed
+  uploadReviewError.value = ''
+  uploadReviewNotice.value = `已批量确认 ${files.length} 个名称相似文件。`
+}
+
+function removeUnconfirmedSimilarFiles() {
+  const files = [...unconfirmedSimilarFiles.value]
+  if (
+    committing.value
+    || preflighting.value
+    || !files.length
+    || !window.confirm(`从待上传清单移除 ${files.length} 个相似且未确认的本地文件？`)
+  ) return
+
+  const removed = removePendingFiles(files)
+  if (selectedFiles.value.length) {
+    uploadReviewNotice.value = `已移除 ${removed} 个相似且未确认的文件。`
+  } else {
+    notice.value = `已移除 ${removed} 个相似且未确认的文件，待上传清单现已为空。`
+  }
 }
 
 function updateFileSimilarities(file: File, candidates: SimilarTrackCandidate[]) {
@@ -1123,6 +1181,7 @@ async function commitSelectedFiles() {
     confirmedSimilarFiles.value = new Set()
     uploadReviewOpen.value = false
     uploadReviewQuery.value = ''
+    uploadReviewFilter.value = 'all'
     uploadReviewError.value = ''
     uploadReviewNotice.value = ''
     if (fileInput.value) fileInput.value.value = ''
@@ -1382,7 +1441,7 @@ onBeforeUnmount(() => {
               <span class="eyebrow">Upload staging</span>
               <h3 id="upload-review-title">确认待上传清单</h3>
               <p id="upload-review-description">
-                提交前可移除文件；名称相似项会高亮显示，并要求逐项二次确认。提交时将锁定目标音乐库“{{ libraryGroup }}”。
+                提交前可移除文件；名称相似项会高亮显示，可筛选后逐项或批量确认。提交时将锁定目标音乐库“{{ libraryGroup }}”。
               </p>
             </div>
             <button
@@ -1403,6 +1462,18 @@ onBeforeUnmount(() => {
             <InlineNotice v-else-if="uploadReviewNotice" class="batch-add-tab__notice" tone="success">
               {{ uploadReviewNotice }}
             </InlineNotice>
+            <div class="field">
+              <label for="upload-review-filter">状态筛选</label>
+              <select
+                id="upload-review-filter"
+                v-model="uploadReviewFilter"
+                :disabled="committing"
+              >
+                <option value="all">全部文件（{{ selectedFiles.length }}）</option>
+                <option value="similar">仅名称相似（{{ similarPendingCount }}）</option>
+                <option value="unconfirmed">相似且未确认（{{ unconfirmedSimilarCount }}）</option>
+              </select>
+            </div>
             <div class="field field--search">
               <label for="upload-review-search">筛选待上传文件</label>
               <input
@@ -1438,6 +1509,22 @@ onBeforeUnmount(() => {
               >
                 添加目录
               </label>
+              <button
+                class="text-button"
+                type="button"
+                :disabled="committing || preflighting || !unconfirmedSimilarCount"
+                @click="confirmUnconfirmedSimilarFiles"
+              >
+                批量确认未确认项（{{ unconfirmedSimilarCount }}）
+              </button>
+              <button
+                class="button button--danger button--small"
+                type="button"
+                :disabled="committing || preflighting || !unconfirmedSimilarCount"
+                @click="removeUnconfirmedSimilarFiles"
+              >
+                批量移除未确认项（{{ unconfirmedSimilarCount }}）
+              </button>
               <button class="text-button" type="button" :disabled="committing" @click="clearPendingFiles">清空</button>
             </div>
           </div>
@@ -1471,7 +1558,7 @@ onBeforeUnmount(() => {
               <button
                 class="button button--danger button--small"
                 type="button"
-                :disabled="committing"
+                :disabled="committing || preflighting"
                 :aria-label="`从待上传清单移除 ${file.name}`"
                 @click="removePendingFile(file)"
               >
@@ -1512,7 +1599,9 @@ onBeforeUnmount(() => {
               </div>
             </article>
             <div v-if="!filteredPendingFiles.length" class="batch-add-tab__empty">
-              没有匹配的待上传文件。
+              <template v-if="uploadReviewFilter === 'unconfirmed'">没有相似且未确认的待上传文件。</template>
+              <template v-else-if="uploadReviewFilter === 'similar'">没有名称相似的待上传文件。</template>
+              <template v-else>没有匹配的待上传文件。</template>
             </div>
           </div>
 

@@ -143,6 +143,7 @@ export const api = {
       if (options.excludeChannelId !== undefined) {
         params.set('exclude_channel_id', String(options.excludeChannelId))
       }
+      if (options.includeMatchingIds) params.set('include_matching_ids', 'true')
       const query = params.toString()
       return request<TrackPage>(`/api/admin/tracks${query ? `?${query}` : ''}`)
     },
