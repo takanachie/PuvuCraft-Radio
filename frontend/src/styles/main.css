@@ -1994,6 +1994,12 @@
 
   .file-drop:hover,
   .file-drop.populated { border-color: var(--phosphor-deep); background: #10150d; }
+  .file-drop.disabled {
+    border-color: #343b38;
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
   .file-drop:has(+ input:focus-visible) {
     outline: 2px solid var(--amber);
     outline-offset: 3px;
@@ -2032,6 +2038,13 @@
   .ingest-note {
     color: var(--dim);
     font: 0.58rem/1.5 var(--mono);
+  }
+
+  .ingest-note--blocked {
+    padding: 0.55rem 0.65rem;
+    border: 1px solid #76552a;
+    color: var(--amber);
+    background: #1d170e;
   }
 
   .upload-queue-panel {
@@ -2082,6 +2095,48 @@
   .local-upload-queue .upload-queue-panel__header {
     border-color: #55452a;
     background: linear-gradient(90deg, rgba(214, 151, 65, 0.08), #0d1110 45%);
+  }
+
+  .failed-upload-queue .upload-queue-panel__header {
+    border-color: #663c37;
+    background: linear-gradient(90deg, rgba(179, 71, 58, 0.12), #0d1110 48%);
+  }
+
+  .failed-upload-queue .queue-metrics strong { color: #d58e84; }
+
+  .failed-upload-queue__summary {
+    display: grid;
+    justify-items: end;
+    gap: 0.65rem;
+  }
+
+  .failed-upload-queue__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.45rem;
+  }
+
+  .failed-upload-queue__frame {
+    max-height: 24rem;
+    overflow-y: auto;
+  }
+
+  .failed-upload-table th {
+    position: sticky;
+    z-index: 1;
+    top: 0;
+  }
+
+  .failed-upload-table td:first-child { min-width: 13rem; }
+  .failed-upload-table td:nth-child(3) { min-width: 9rem; }
+  .failed-upload-table td:nth-child(5) { min-width: 18rem; }
+
+  .failed-upload-reason > strong {
+    color: #d7aaa4 !important;
+    font-size: 0.72rem !important;
+    line-height: 1.45;
+    white-space: normal;
   }
 
   .local-upload-queue__frame {
@@ -2998,6 +3053,8 @@
     .ingest-rack { grid-template-columns: 1fr; }
     .upload-queue-panel__header { align-items: flex-start; flex-direction: column; }
     .queue-metrics span { justify-items: start; }
+    .failed-upload-queue__summary { justify-items: start; }
+    .failed-upload-queue__actions { justify-content: flex-start; }
     .library-toolbar { align-items: stretch; flex-direction: column; }
     .library-management { grid-template-columns: 1fr; }
     .library-management > header { grid-column: 1; }

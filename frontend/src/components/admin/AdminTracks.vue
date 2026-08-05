@@ -11,13 +11,21 @@ import type {
   UploadJobStatus,
   UploadQueueSnapshot,
 } from '../../api/types'
-import { formatDuration, formatFileSize } from '../../utils/format'
+import { formatDateTime, formatDuration, formatFileSize } from '../../utils/format'
 import { SingleFlightRequest } from '../../utils/singleFlightRequest'
+import {
+  isAdditionalUploadTargetLocked,
+  isRetryableUploadFailure,
+  isUploadFailureStatus,
+  isUploadRetryBlocked,
+  unhandledUploadFailures,
+} from '../../utils/uploadQueue'
 import InlineNotice from '../InlineNotice.vue'
 import StatusBadge from '../StatusBadge.vue'
 
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 const MAX_LOCAL_UPLOADS = 1000
+const HANDLED_UPLOAD_FAILURES_STORAGE_KEY = 'puvucraft.handled-upload-failures.v1'
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.flac', '.m4a', '.aac', '.wav', '.ogg'])
 const CLIENT_BOUND_UPLOADS = new Set<UploadJobStatus>(['queued', 'ready', 'uploading'])
 const VISIBLE_UPLOADS = new Set<UploadJobStatus>([
@@ -61,6 +69,18 @@ type UploadReviewFilter = 'all' | 'similar' | 'unconfirmed'
 function createUploadClientId(): string {
   const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+function loadHandledUploadFailureIds(): Set<string> {
+  try {
+    const stored = window.localStorage.getItem(HANDLED_UPLOAD_FAILURES_STORAGE_KEY)
+    if (!stored) return new Set()
+    const ids = JSON.parse(stored) as unknown
+    if (!Array.isArray(ids)) return new Set()
+    return new Set(ids.filter((id): id is string => typeof id === 'string'))
+  } catch {
+    return new Set()
+  }
 }
 
 const uploadClientId = createUploadClientId()
@@ -115,8 +135,10 @@ const uploadQueue = ref<UploadQueueSnapshot>({
 const queueLoading = ref(true)
 const localUploadBytes = reactive<Record<string, number>>({})
 const filesByJob = new Map<string, File>()
+const failedFilesByJob = reactive(new Map<string, File>())
 const requestsByJob = new Map<string, XMLHttpRequest>()
 const handledTerminalJobs = new Set<string>()
+const handledUploadFailureIds = ref<Set<string>>(loadHandledUploadFailureIds())
 let eventSource: EventSource | null = null
 let heartbeatTimer: number | undefined
 let heartbeatSeconds = 0
@@ -145,6 +167,34 @@ const currentLibraryTrackCount = computed(() =>
 )
 const visibleUploadJobs = computed(() =>
   uploadQueue.value.jobs.filter((job) => VISIBLE_UPLOADS.has(job.status)),
+)
+const failedUploadJobs = computed(() =>
+  unhandledUploadFailures(uploadQueue.value.jobs, handledUploadFailureIds.value),
+)
+const failedUploadCount = computed(() =>
+  failedUploadJobs.value.filter((job) => job.status === 'failed').length,
+)
+const rejectedUploadCount = computed(() =>
+  failedUploadJobs.value.filter((job) => job.status === 'rejected').length,
+)
+const expiredUploadCount = computed(() =>
+  failedUploadJobs.value.filter((job) => job.status === 'expired').length,
+)
+const retryableFailedUploadCount = computed(() =>
+  failedUploadJobs.value.filter((job) => canRetryFailedUpload(job)).length,
+)
+const additionalUploadTargetsLocked = computed(() =>
+  isAdditionalUploadTargetLocked(submittedUploads.value.length),
+)
+const uploadPickerDisabled = computed(() =>
+  committing.value || additionalUploadTargetsLocked.value,
+)
+const failedUploadRetryQueueBlocked = computed(() =>
+  isUploadRetryBlocked(
+    submittedUploads.value.length,
+    selectedFiles.value.length,
+    committing.value || preflighting.value || feedingSubmitted.value,
+  ),
 )
 const currentLibraryTargetUploadCount = computed(() =>
   submittedUploads.value.filter((task) => task.targetLibrary === libraryGroup.value).length
@@ -196,6 +246,26 @@ const filteredPendingFiles = computed(() => {
 function clearMessages() {
   error.value = ''
   notice.value = ''
+}
+
+function persistHandledUploadFailureIds(ids: Set<string>) {
+  try {
+    window.localStorage.setItem(
+      HANDLED_UPLOAD_FAILURES_STORAGE_KEY,
+      JSON.stringify([...ids]),
+    )
+  } catch {
+    // Failure acknowledgement still works for the current page when storage is unavailable.
+  }
+}
+
+function setHandledUploadFailureIds(ids: Set<string>) {
+  handledUploadFailureIds.value = ids
+  persistHandledUploadFailureIds(ids)
+}
+
+function additionalUploadTargetBlockedMessage(): string {
+  return `本地已提交队列仍有 ${submittedUploads.value.length} 个文件；请等待队列清空或先移除现有任务，再添加新的上传目标。`
 }
 
 async function load(preserveSelection = true, background = false, page = trackPage.value) {
@@ -534,12 +604,18 @@ function stageFiles(
   ignoredUnsupported = 0,
 ) {
   if (!files.length && !ignoredUnsupported) return
+  if (additionalUploadTargetsLocked.value) {
+    clearMessages()
+    error.value = additionalUploadTargetBlockedMessage()
+    return
+  }
   clearMessages()
   uploadReviewError.value = ''
   const existingKeys = new Set([
     ...selectedFiles.value.map(pendingFileKey),
     ...submittedUploads.value.map((task) => pendingFileKey(task.file)),
     ...[...filesByJob.values()].map(pendingFileKey),
+    ...[...failedFilesByJob.values()].map(pendingFileKey),
   ])
   const additions: File[] = []
   let duplicateCount = 0
@@ -596,7 +672,11 @@ function stageFiles(
 
 function chooseFiles(event: Event) {
   const input = event.target as HTMLInputElement
-  if (committing.value) {
+  if (uploadPickerDisabled.value) {
+    if (additionalUploadTargetsLocked.value) {
+      clearMessages()
+      error.value = additionalUploadTargetBlockedMessage()
+    }
     input.value = ''
     return
   }
@@ -606,7 +686,11 @@ function chooseFiles(event: Event) {
 
 function chooseDirectory(event: Event) {
   const input = event.target as HTMLInputElement
-  if (committing.value) {
+  if (uploadPickerDisabled.value) {
+    if (additionalUploadTargetsLocked.value) {
+      clearMessages()
+      error.value = additionalUploadTargetBlockedMessage()
+    }
     input.value = ''
     return
   }
@@ -794,6 +878,124 @@ function uploadStatus(job: UploadJob): string {
   return UPLOAD_LABELS[job.status]
 }
 
+function canRetryFailedUpload(job: UploadJob): boolean {
+  return isRetryableUploadFailure(
+    job,
+    isOwnedJob(job),
+    failedFilesByJob.has(job.id),
+  )
+}
+
+function failedUploadRetryBlocked(job: UploadJob): boolean {
+  return !canRetryFailedUpload(job) || failedUploadRetryQueueBlocked.value
+}
+
+function failedUploadReason(job: UploadJob): string {
+  if (job.error_message) return job.error_message
+  if (job.status === 'rejected') return '服务器已驳回该文件，请核对重复内容或格式。'
+  if (job.status === 'expired') return '任务已过期，请确认页面连接和服务器状态。'
+  return '服务器处理失败，未返回更多原因。'
+}
+
+function failedUploadSourceHint(job: UploadJob): string {
+  if (canRetryFailedUpload(job)) return '本页面仍持有源文件，可直接重新排队。'
+  if (job.duplicate || job.error_code === 'duplicate_content') {
+    return 'SHA-256 与已有曲目一致，禁止重试。'
+  }
+  if (isOwnedJob(job)) return '本页面已无法安全重试，请修正后重新选择源文件。'
+  return '任务来自其他页面或管理员，当前页面没有源文件。'
+}
+
+function handleUploadFailure(job: UploadJob, showNotice = true) {
+  const handled = new Set(handledUploadFailureIds.value)
+  handled.add(job.id)
+  setHandledUploadFailureIds(handled)
+  failedFilesByJob.delete(job.id)
+  if (showNotice) {
+    clearMessages()
+    notice.value = `已将“${job.original_filename}”标记为已处理。`
+  }
+}
+
+function handleAllUploadFailures() {
+  const failures = [...failedUploadJobs.value]
+  if (
+    !failures.length
+    || !window.confirm(`将当前 ${failures.length} 条失败记录全部标记为已处理？`)
+  ) return
+
+  const handled = new Set(handledUploadFailureIds.value)
+  for (const job of failures) {
+    handled.add(job.id)
+    failedFilesByJob.delete(job.id)
+  }
+  setHandledUploadFailureIds(handled)
+  clearMessages()
+  notice.value = `已将 ${failures.length} 条失败记录标记为已处理。`
+}
+
+function failedUploadRetryBlockedMessage(): string {
+  if (submittedUploads.value.length) return additionalUploadTargetBlockedMessage()
+  if (selectedFiles.value.length) return '请先处理当前待上传清单，再重试失败文件。'
+  return '上传队列正在变更，请稍后再重试。'
+}
+
+function retryFailedUploads(jobs: UploadJob[]) {
+  if (failedUploadRetryQueueBlocked.value) {
+    clearMessages()
+    error.value = failedUploadRetryBlockedMessage()
+    return
+  }
+
+  const retriedJobs: UploadJob[] = []
+  const tasks: SubmittedUploadTask[] = []
+  for (const job of jobs) {
+    const file = failedFilesByJob.get(job.id)
+    const targetLibrary = job.target_library
+    if (!file || !targetLibrary || !canRetryFailedUpload(job)) continue
+    retriedJobs.push(job)
+    tasks.push({
+      id: createUploadClientId(),
+      file,
+      targetLibrary,
+      similarities: [],
+    })
+  }
+  if (!tasks.length) return
+
+  const handled = new Set(handledUploadFailureIds.value)
+  for (const job of retriedJobs) {
+    handled.add(job.id)
+    failedFilesByJob.delete(job.id)
+  }
+  setHandledUploadFailureIds(handled)
+  submittedQueueError.value = ''
+  submittedUploads.value = tasks
+  clearMessages()
+  notice.value = tasks.length === 1
+    ? `已将“${tasks[0].file.name}”重新加入本地已提交队列；推送前会再次检查相似内容。`
+    : `已将 ${tasks.length} 个失败文件批量重新加入本地已提交队列；队列清空前不能添加其他上传目标。`
+  scheduleSubmittedUploads()
+}
+
+function retryFailedUpload(job: UploadJob) {
+  retryFailedUploads([job])
+}
+
+function retryAllFailedUploads() {
+  const retryableJobs = failedUploadJobs.value.filter((job) => canRetryFailedUpload(job))
+  if (!retryableJobs.length) return
+  if (failedUploadRetryQueueBlocked.value) {
+    clearMessages()
+    error.value = failedUploadRetryBlockedMessage()
+    return
+  }
+  if (!window.confirm(
+    `批量重试 ${retryableJobs.length} 个失败文件？它们会先进入本地已提交队列，队列清空前不能添加其他上传目标。`,
+  )) return
+  retryFailedUploads(retryableJobs)
+}
+
 function uploadBytes(job: UploadJob): number {
   return localUploadBytes[job.id] ?? job.bytes_received
 }
@@ -888,6 +1090,15 @@ function applyUploadSnapshot(snapshot: UploadQueueSnapshot) {
     if (job.status === 'ready') startTransfer(job)
     if (TERMINAL_UPLOADS.has(job.status) && !handledTerminalJobs.has(job.id)) {
       handledTerminalJobs.add(job.id)
+      const localFile = filesByJob.get(job.id)
+      if (
+        isUploadFailureStatus(job.status)
+        && isOwnedJob(job)
+        && localFile
+        && !handledUploadFailureIds.value.has(job.id)
+      ) {
+        failedFilesByJob.set(job.id, localFile)
+      }
       if (job.status === 'completed') refreshLibrary = true
       if (isOwnedJob(job)) {
         if (job.status === 'completed') {
@@ -901,6 +1112,20 @@ function applyUploadSnapshot(snapshot: UploadQueueSnapshot) {
       filesByJob.delete(job.id)
       delete localUploadBytes[job.id]
     }
+  }
+  const snapshotFailureIds = new Set(
+    snapshot.jobs
+      .filter((job) => isUploadFailureStatus(job.status))
+      .map((job) => job.id),
+  )
+  for (const jobId of failedFilesByJob.keys()) {
+    if (!snapshotFailureIds.has(jobId)) failedFilesByJob.delete(jobId)
+  }
+  const retainedHandledIds = new Set(
+    [...handledUploadFailureIds.value].filter((jobId) => snapshotFailureIds.has(jobId)),
+  )
+  if (retainedHandledIds.size !== handledUploadFailureIds.value.size) {
+    setHandledUploadFailureIds(retainedHandledIds)
   }
   if (refreshLibrary) scheduleLibraryRefresh()
   scheduleSubmittedUploads()
@@ -1367,9 +1592,22 @@ onBeforeUnmount(() => {
     <section class="ingest-rack" aria-labelledby="ingest-title">
       <div class="ingest-rack__upload">
         <span class="eyebrow" id="ingest-title">Upload bus</span>
-        <label class="file-drop" :class="{ populated: selectedFiles.length }" for="track-files">
+        <label
+          class="file-drop"
+          :class="{ populated: selectedFiles.length, disabled: uploadPickerDisabled }"
+          :aria-disabled="uploadPickerDisabled"
+          for="track-files"
+        >
           <span aria-hidden="true">＋</span>
-          <strong>{{ selectedFiles.length ? '继续添加音频文件' : '选择音频文件' }}</strong>
+          <strong>
+            {{
+              additionalUploadTargetsLocked
+                ? '等待本地队列清空'
+                : selectedFiles.length
+                  ? '继续添加音频文件'
+                  : '选择音频文件'
+            }}
+          </strong>
           <small>MP3 / FLAC / M4A / AAC / WAV / OGG · 每个最大 500 MiB</small>
         </label>
         <input
@@ -1379,7 +1617,7 @@ onBeforeUnmount(() => {
           type="file"
           multiple
           accept=".mp3,.flac,.m4a,.aac,.wav,.ogg"
-          :disabled="committing"
+          :disabled="uploadPickerDisabled"
           @change="chooseFiles"
         />
         <div v-if="selectedFiles.length" class="pending-upload-summary">
@@ -1395,6 +1633,9 @@ onBeforeUnmount(() => {
         >
           管理并确认待上传清单
         </button>
+        <small v-if="additionalUploadTargetsLocked" class="ingest-note ingest-note--blocked">
+          本地已提交队列还有 {{ submittedUploads.length }} 个文件。为避免混入新的上传批次，队列清空前不能继续添加文件或目录。
+        </small>
         <small class="ingest-note">当前上传目标为“{{ libraryGroup }}”。名称相似时需二次确认，SHA-256 完全相同会自动驳回。确认后的全部文件会锁定目标曲库并在本地等待；关闭页面会清空本地等待任务、取消远端任务并清理临时文件。</small>
       </div>
       <div class="ingest-rack__scan">
@@ -1403,7 +1644,8 @@ onBeforeUnmount(() => {
         <p>由操作者选择本机目录；浏览器枚举目录后会先按 MP3 / FLAC / M4A / AAC / WAV / OGG 扩展名过滤，其他文件不会进入待上传清单。</p>
         <label
           class="button button--quiet upload-picker-button"
-          :class="{ disabled: committing }"
+          :class="{ disabled: uploadPickerDisabled }"
+          :aria-disabled="uploadPickerDisabled"
           for="track-directory"
         >
           选择本地目录
@@ -1416,7 +1658,7 @@ onBeforeUnmount(() => {
           multiple
           webkitdirectory
           accept=".mp3,.flac,.m4a,.aac,.wav,.ogg"
-          :disabled="committing"
+          :disabled="uploadPickerDisabled"
           @change="chooseDirectory"
         />
       </div>
@@ -1497,14 +1739,16 @@ onBeforeUnmount(() => {
               </span>
               <label
                 class="button button--quiet button--small upload-picker-button"
-                :class="{ disabled: committing }"
+                :class="{ disabled: uploadPickerDisabled }"
+                :aria-disabled="uploadPickerDisabled"
                 for="track-files"
               >
                 添加文件
               </label>
               <label
                 class="button button--quiet button--small upload-picker-button"
-                :class="{ disabled: committing }"
+                :class="{ disabled: uploadPickerDisabled }"
+                :aria-disabled="uploadPickerDisabled"
                 for="track-directory"
               >
                 添加目录
@@ -1693,6 +1937,105 @@ onBeforeUnmount(() => {
                     @click="removeSubmittedUpload(task)"
                   >
                     移除
+                  </button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="upload-queue-panel failed-upload-queue" aria-labelledby="failed-upload-queue-title">
+      <header class="upload-queue-panel__header">
+        <div>
+          <span class="eyebrow">Upload failure inbox</span>
+          <h3 id="failed-upload-queue-title">上传失败处理清单</h3>
+          <p>失败、驳回和过期任务会保留在这里，直到管理员重试或明确处理，不会因后续队列刷新而消失；SHA-256 一致的文件禁止重试，“标记已处理”只整理当前浏览器清单。</p>
+        </div>
+        <div class="failed-upload-queue__summary">
+          <div class="queue-metrics">
+            <span><strong>{{ failedUploadJobs.length }}</strong>待处理</span>
+            <span><strong>{{ failedUploadCount }}</strong>处理失败</span>
+            <span><strong>{{ rejectedUploadCount }}</strong>已驳回</span>
+            <span><strong>{{ expiredUploadCount }}</strong>已过期</span>
+            <span><strong>{{ retryableFailedUploadCount }}</strong>可重试</span>
+          </div>
+          <div class="failed-upload-queue__actions">
+            <button
+              v-if="retryableFailedUploadCount"
+              class="button button--primary button--small"
+              type="button"
+              :disabled="failedUploadRetryQueueBlocked"
+              :title="failedUploadRetryQueueBlocked ? failedUploadRetryBlockedMessage() : '批量重试全部可重试文件'"
+              @click="retryAllFailedUploads"
+            >
+              批量重试可重试项（{{ retryableFailedUploadCount }}）
+            </button>
+            <button
+              v-if="failedUploadJobs.length"
+              class="button button--quiet button--small"
+              type="button"
+              @click="handleAllUploadFailures"
+            >
+              全部标记已处理
+            </button>
+          </div>
+        </div>
+      </header>
+      <div class="data-frame failed-upload-queue__frame">
+        <table class="console-table failed-upload-table">
+          <thead>
+            <tr><th>文件</th><th>申请人</th><th>目标音乐库</th><th>结果</th><th>失败原因</th><th>发生时间</th><th class="align-right">处理</th></tr>
+          </thead>
+          <tbody>
+            <tr v-if="!failedUploadJobs.length">
+              <td colspan="7" class="table-message">当前没有待处理的上传失败记录。</td>
+            </tr>
+            <template v-else>
+              <tr v-for="job in failedUploadJobs" :key="job.id">
+                <td data-label="文件">
+                  <strong>{{ job.original_filename }}</strong>
+                  <small>{{ formatFileSize(job.declared_size_bytes) }} · {{ job.id.slice(0, 8) }}</small>
+                </td>
+                <td data-label="申请人">
+                  <strong>{{ job.owner.username }}</strong>
+                  <small>{{ isOwnedJob(job) ? '本页面任务' : '其他页面或管理员' }}</small>
+                </td>
+                <td data-label="目标音乐库"><span class="mono-label">{{ job.target_library || '已删除' }}</span></td>
+                <td data-label="结果"><StatusBadge :status="job.status" :label="uploadStatus(job)" /></td>
+                <td data-label="失败原因" class="failed-upload-reason">
+                  <strong>{{ failedUploadReason(job) }}</strong>
+                  <small v-if="job.error_code" class="mono-label">{{ job.error_code }}</small>
+                  <small>{{ failedUploadSourceHint(job) }}</small>
+                </td>
+                <td data-label="发生时间" class="mono-label">{{ formatDateTime(job.completed_at || job.updated_at) }}</td>
+                <td data-label="处理" class="table-actions">
+                  <button
+                    v-if="canRetryFailedUpload(job)"
+                    class="button button--primary button--small"
+                    type="button"
+                    :disabled="failedUploadRetryBlocked(job)"
+                    :title="failedUploadRetryBlocked(job) ? '请先清空待上传清单和本地已提交队列' : '使用本页面保留的源文件重新排队'"
+                    @click="retryFailedUpload(job)"
+                  >
+                    重新排队
+                  </button>
+                  <button
+                    v-else-if="job.duplicate || job.error_code === 'duplicate_content'"
+                    class="button button--danger button--small"
+                    type="button"
+                    disabled
+                    title="SHA-256 与已有曲目一致，禁止重试"
+                  >
+                    禁止重试
+                  </button>
+                  <button
+                    class="button button--quiet button--small"
+                    type="button"
+                    @click="handleUploadFailure(job)"
+                  >
+                    标记已处理
                   </button>
                 </td>
               </tr>
