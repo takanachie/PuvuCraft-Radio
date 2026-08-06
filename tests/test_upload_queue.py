@@ -79,13 +79,12 @@ def test_upload_heartbeat_succeeds_with_a_single_database_connection(
     create_engine = database_module.create_engine
 
     def create_single_connection_engine(url, **kwargs):
-        return create_engine(
-            url,
-            **kwargs,
+        kwargs.update(
             pool_size=1,
             max_overflow=0,
             pool_timeout=0.2,
         )
+        return create_engine(url, **kwargs)
 
     monkeypatch.setattr(database_module, "create_engine", create_single_connection_engine)
     with TestClient(create_app(settings)) as client:

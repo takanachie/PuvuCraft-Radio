@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from backend.app.models import AuditEvent, Channel, LoginSession, User
+from backend.app.models import AuditEvent, Channel, LoginSession, User, utcnow
+from backend.app.serializers import iso
 
 from .conftest import csrf_headers
 
@@ -69,7 +70,7 @@ def test_registration_approval_and_session_revocation(
             json={"username": "listener", "password": "listener-password"},
         )
         assert login.status_code == 200
-        active_at = datetime(2026, 7, 30, 1, 2, 3, tzinfo=UTC)
+        active_at = utcnow().replace(microsecond=0)
         with admin.app.state.database.session_factory.begin() as db:
             user = db.get(User, user_id)
             login_session = db.scalar(
@@ -83,7 +84,7 @@ def test_registration_approval_and_session_revocation(
             for user in admin.get("/api/admin/users").json()
             if user["id"] == user_id
         )
-        assert listed_user["last_active_at"] == "2026-07-30T01:02:03Z"
+        assert listed_user["last_active_at"] == iso(active_at)
         assert listed_user["last_active_at"] != listed_user["last_login_at"]
         assert listener.get("/api/channels").status_code == 200
         assert listener.get("/api/admin/users").status_code == 403
@@ -92,6 +93,11 @@ def test_registration_approval_and_session_revocation(
             channel = db.get(Channel, 1)
             assert channel is not None and channel.playback_state is not None
             channel.playback_state.status = "live"
+
+        async def hls_ready(channel_id: int) -> None:
+            assert channel_id == 1
+
+        admin.app.state.playback.ensure_hls_stream = hls_ready
         assert listener.get(
             "/api/internal/stream-auth",
             headers={"X-Original-URI": "/hls/default/index.m3u8"},
@@ -106,6 +112,10 @@ def test_registration_approval_and_session_revocation(
         assert disabled.status_code == 200
         assert admin.app.state.listeners.count(1) == 0
         assert admin.get("/api/admin/listeners").json() == []
+        assert listener.get(
+            "/api/internal/stream-auth",
+            headers={"X-Original-URI": "/hls/default/index.m3u8"},
+        ).status_code == 401
         assert listener.get("/api/auth/me").status_code == 401
 
 

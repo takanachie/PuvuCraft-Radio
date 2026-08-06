@@ -177,6 +177,11 @@ sudoedit /opt/radio/config.yaml
 
 配置中的相对路径按配置文件目录解析。生产示例默认使用绝对路径。
 
+`database` 段建议保持生产示例值：SQLite 使用 WAL 和 `FULL` 同步级别，连接池为 2
+且不允许临时溢出，每条连接的页缓存限制为 2 MiB。`sqlite_mmap_size_bytes` 是读取映射
+上限，不会一次性占用同等大小的物理内存；默认 64 MiB 对 2 GiB 主机也保持保守，实际
+驻留页仍可由内核回收。不要通过扩大连接池或 mmap 上限来掩盖慢查询。
+
 应用不会代替操作系统挂载磁盘。额外磁盘应先通过 `/etc/fstab` 或等价机制挂载，再把其中的媒体根目录加入 `storage.locations`。`priority` 数值越大越优先；写入后预计磁盘占用超过 `max_usage_percent` 时，应用自动选择下一可用位置。生产配置建议保持 `create_if_missing: false`，防止挂载缺失时误写到系统盘。
 
 每个额外挂载还必须加入 systemd 的挂载依赖与写入白名单。例如：

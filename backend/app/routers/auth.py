@@ -178,6 +178,7 @@ def login(
     user.last_login_at = utcnow()
     user.updated_at = utcnow()
     db.commit()
+    auth.invalidate_user(user.id)
     auth.set_session_cookies(response, raw_token, csrf_token)
     return {"user": user_dict(user)}
 
@@ -193,6 +194,7 @@ def logout(
     auth.verify_csrf(request, login_session)
     login_session.revoked_at = utcnow()
     db.commit()
+    auth.invalidate_session(login_session.id)
     auth.clear_session_cookies(response)
     response.status_code = 204
     return response

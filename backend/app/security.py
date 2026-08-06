@@ -10,6 +10,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -17,13 +18,25 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import Request, Response
 from sqlalchemy import delete, or_, select, update
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from .config import Settings
 from .errors import ApiError
 from .models import LoginSession, User, utcnow
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedIdentity:
+    session_id: int
+    user_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedIdentity:
+    identity: AuthenticatedIdentity
+    expires_at_monotonic: float
 
 
 def normalize_identity(value: str) -> str:
@@ -116,6 +129,10 @@ class AuthService:
         self.settings = settings
         self.passwords = PasswordHasher()
         self._dummy_password_hash = self.passwords.hash(secrets.token_urlsafe(24))
+        self._stream_sessions: OrderedDict[str, _CachedIdentity] = OrderedDict()
+        self._stream_sessions_lock = threading.RLock()
+        self._max_stream_sessions = max(64, settings.stream_access.max_listeners * 4)
+        self._stream_cache_generation = 0
 
     def hash_session_token(self, token: str) -> str:
         return hmac.new(
@@ -167,6 +184,8 @@ class AuthService:
         )
         for stale_session in active_sessions[9:]:
             stale_session.revoked_at = now
+        if len(active_sessions) > 9:
+            self.invalidate_user(user.id)
         db.add(session)
         return raw_token, csrf_token, session
 
@@ -220,14 +239,17 @@ class AuthService:
             samesite=session_config.same_site,
         )
 
-    def authenticate_request(self, request: Request, db: Session) -> LoginSession:
+    def _request_session_hash(self, request: Request) -> str:
         raw_token = request.cookies.get(self.settings.auth.session.cookie_name)
         if not raw_token:
             raise ApiError(401, "authentication_required", "请先登录")
+        return self.hash_session_token(raw_token)
+
+    def _authenticate_session_hash(self, token_hash: str, db: Session) -> LoginSession:
         login_session = db.scalar(
             select(LoginSession)
             .options(joinedload(LoginSession.user))
-            .where(LoginSession.token_hash == self.hash_session_token(raw_token))
+            .where(LoginSession.token_hash == token_hash)
         )
         now = utcnow()
         if (
@@ -246,6 +268,80 @@ class AuthService:
             db.commit()
         return login_session
 
+    def authenticate_request(self, request: Request, db: Session) -> LoginSession:
+        return self._authenticate_session_hash(self._request_session_hash(request), db)
+
+    def authenticate_stream_request(
+        self,
+        request: Request,
+        session_factory: sessionmaker[Session],
+    ) -> AuthenticatedIdentity:
+        """Authenticate high-frequency HLS requests without retaining ORM objects."""
+        token_hash = self._request_session_hash(request)
+        ttl_seconds = self.settings.stream_access.authorization_cache_seconds
+        if ttl_seconds <= 0:
+            with session_factory() as db:
+                login_session = self._authenticate_session_hash(token_hash, db)
+                return AuthenticatedIdentity(login_session.id, login_session.user_id)
+
+        now_monotonic = time.monotonic()
+        with self._stream_sessions_lock:
+            cached = self._stream_sessions.get(token_hash)
+            if cached is not None and cached.expires_at_monotonic > now_monotonic:
+                self._stream_sessions.move_to_end(token_hash)
+                return cached.identity
+            self._stream_sessions.pop(token_hash, None)
+            cache_generation = self._stream_cache_generation
+
+        # Never hold the cache lock while waiting for the bounded SQLite pool. This
+        # keeps administrative revocation from deadlocking behind an HLS cache miss.
+        with session_factory() as db:
+            login_session = self._authenticate_session_hash(token_hash, db)
+            identity = AuthenticatedIdentity(login_session.id, login_session.user_id)
+            now = utcnow()
+            hard_expiry = min(
+                aware_utc(login_session.expires_at),
+                aware_utc(login_session.last_seen_at)
+                + timedelta(hours=self.settings.auth.session.idle_timeout_hours),
+            )
+            valid_for = min(ttl_seconds, max(0.0, (hard_expiry - now).total_seconds()))
+        with self._stream_sessions_lock:
+            if valid_for > 0 and cache_generation == self._stream_cache_generation:
+                self._stream_sessions[token_hash] = _CachedIdentity(
+                    identity=identity,
+                    expires_at_monotonic=now_monotonic + valid_for,
+                )
+                while len(self._stream_sessions) > self._max_stream_sessions:
+                    self._stream_sessions.popitem(last=False)
+            return identity
+
+    def invalidate_session(self, session_id: int) -> None:
+        with self._stream_sessions_lock:
+            self._stream_cache_generation += 1
+            stale = [
+                key
+                for key, cached in self._stream_sessions.items()
+                if cached.identity.session_id == session_id
+            ]
+            for key in stale:
+                self._stream_sessions.pop(key, None)
+
+    def invalidate_user(self, user_id: int) -> None:
+        with self._stream_sessions_lock:
+            self._stream_cache_generation += 1
+            stale = [
+                key
+                for key, cached in self._stream_sessions.items()
+                if cached.identity.user_id == user_id
+            ]
+            for key in stale:
+                self._stream_sessions.pop(key, None)
+
+    def clear_stream_cache(self) -> None:
+        with self._stream_sessions_lock:
+            self._stream_cache_generation += 1
+            self._stream_sessions.clear()
+
     def verify_csrf(self, request: Request, login_session: LoginSession) -> None:
         if not self.settings.auth.csrf.enabled:
             return
@@ -257,6 +353,7 @@ class AuthService:
             raise ApiError(403, "csrf_failed", "请求安全令牌无效")
 
     def revoke_user_sessions(self, db: Session, user_id: int) -> None:
+        self.invalidate_user(user_id)
         db.execute(
             update(LoginSession)
             .where(LoginSession.user_id == user_id, LoginSession.revoked_at.is_(None))

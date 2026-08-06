@@ -89,7 +89,7 @@ def channel_dict(
 ) -> dict[str, object]:
     state = channel.playback_state
     item = None
-    if state and state.current_item_id:
+    if state and state.current_item_id and not (runtime and "current_track" in runtime):
         item = db.scalar(
             select(PlaylistItem)
             .options(joinedload(PlaylistItem.track))

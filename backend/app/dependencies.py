@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .errors import ApiError
 from .models import LoginSession, User
-from .security import AuthService
+from .security import AuthenticatedIdentity, AuthService
 
 
 def get_settings(request: Request) -> Settings:
@@ -39,6 +39,13 @@ def authenticate_once(request: Request) -> int:
     with request.app.state.database.session_factory() as db:
         login_session = request.app.state.auth.authenticate_request(request, db)
         return login_session.id
+
+
+def authenticate_stream_once(request: Request) -> AuthenticatedIdentity:
+    return request.app.state.auth.authenticate_stream_request(
+        request,
+        request.app.state.database.session_factory,
+    )
 
 
 def _authenticate_admin_once(request: Request, *, verify_csrf: bool) -> int:

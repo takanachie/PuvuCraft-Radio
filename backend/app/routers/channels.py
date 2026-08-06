@@ -13,9 +13,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from ..config import Settings
-from ..dependencies import authenticate_once, get_current_user, get_db, get_settings
+from ..dependencies import (
+    authenticate_once,
+    authenticate_stream_once,
+    get_current_user,
+    get_db,
+    get_settings,
+)
 from ..errors import ApiError
 from ..models import Channel, PlaylistItem, User, utcnow
+from ..security import AuthenticatedIdentity
 from ..serializers import channel_dict, iso, playlist_item_dict
 from ..services.playback import StreamUnavailable
 
@@ -151,28 +158,21 @@ def _sse(event: str, payload: dict[str, object]) -> str:
 @router.get("/api/internal/stream-auth", status_code=204)
 async def stream_authorization(
     request: Request,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    identity: AuthenticatedIdentity = Depends(authenticate_stream_once),
 ) -> Response:
     original_uri = request.headers.get("X-Original-URI", "")
     path = unquote(urlsplit(original_uri).path)
     match = _HLS_URI.fullmatch(path)
     if not match:
         raise ApiError(403, "invalid_stream_path", "无效的音频流地址")
-    channel_id = db.scalar(
-        select(Channel.id)
-        .where(
-            Channel.slug == match.group(1),
-            Channel.enabled.is_(True),
-        )
-    )
+    channel_id = request.app.state.playback.resolve_enabled_channel(match.group(1))
     if channel_id is None:
         raise ApiError(403, "stream_unavailable", "频道当前不可用")
     try:
         await request.app.state.playback.ensure_hls_stream(channel_id)
     except (StreamUnavailable, TimeoutError) as exc:
         raise ApiError(403, "stream_unavailable", "频道当前不可用") from exc
-    request.app.state.listeners.touch(user.id, channel_id)
+    request.app.state.listeners.touch(identity.user_id, channel_id)
     request.app.state.playback.touch_demand(channel_id)
     return Response(status_code=204)
 
@@ -189,21 +189,14 @@ async def development_hls(
     slug: str,
     file_path: str,
     request: Request,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    identity: AuthenticatedIdentity = Depends(authenticate_stream_once),
     settings: Settings = Depends(get_settings),
 ) -> FileResponse:
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
         raise ApiError(404, "stream_not_found", "音频流不存在")
     if not re.fullmatch(r"(?:index\.m3u8|g[0-9]+-seg-[0-9]+\.ts)", file_path):
         raise ApiError(404, "stream_not_found", "音频流不存在")
-    channel_id = db.scalar(
-        select(Channel.id)
-        .where(
-            Channel.slug == slug,
-            Channel.enabled.is_(True),
-        )
-    )
+    channel_id = request.app.state.playback.resolve_enabled_channel(slug)
     if channel_id is None:
         raise ApiError(404, "stream_not_found", "音频流不存在")
     try:
@@ -214,7 +207,7 @@ async def development_hls(
     target = (root / file_path).resolve()
     if root not in target.parents or not target.is_file():
         raise ApiError(404, "stream_not_found", "音频流尚未就绪")
-    request.app.state.listeners.touch(user.id, channel_id)
+    request.app.state.listeners.touch(identity.user_id, channel_id)
     request.app.state.playback.touch_demand(channel_id)
     media_type = "application/vnd.apple.mpegurl" if target.suffix == ".m3u8" else "video/mp2t"
     return FileResponse(target, media_type=media_type)

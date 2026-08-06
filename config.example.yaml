@@ -25,6 +25,12 @@ paths:
 database:
   url: "sqlite:///./data/radio.db"
   sqlite_wal: true
+  sqlite_synchronous: "FULL"
+  sqlite_mmap_size_bytes: 67108864
+  sqlite_cache_size_kib: 2048
+  sqlite_journal_size_limit_bytes: 16777216
+  pool_size: 2
+  pool_timeout_seconds: 5
   busy_timeout_ms: 5000
 
 auth:

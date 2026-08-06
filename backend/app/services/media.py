@@ -413,6 +413,10 @@ class MediaService:
                 "target_music_library_not_found",
                 "目标音乐库不存在，请重新选择",
             )
+        # The caller deliberately supplies a clean session. End the validation
+        # transaction before FFprobe, normalization and hashing so large uploads do
+        # not occupy one of the small number of SQLite connections.
+        db.rollback()
         original_extension = self.validate_filename(original_filename)
         normalized_path: Path | None = None
         placement_path: Path | None = None
@@ -440,19 +444,38 @@ class MediaService:
                 except StorageUnavailable:
                     existing_path = None
                 if existing_path is not None and existing_path.is_file() and existing.available:
+                    db.expunge(existing)
+                    db.rollback()
                     return existing, True
-                if status_callback:
-                    status_callback("placing")
+            db.rollback()
+            if status_callback:
+                status_callback("placing")
+            try:
+                placement = self.storage.place(
+                    retained_path,
+                    final_extension,
+                    digest,
+                    job_id or uuid.uuid4().hex,
+                )
+            except StorageUnavailable as exc:
+                raise ApiError(507, "storage_unavailable", str(exc)) from exc
+            placement_path = placement.path
+
+            # Recheck after the potentially long durable copy. The digest lock
+            # serializes in-process imports, while the unique index remains the
+            # final protection against an out-of-process writer.
+            existing = db.scalar(select(Track).where(Track.sha256 == digest))
+            if existing is not None:
                 try:
-                    placement = self.storage.place(
-                        retained_path,
-                        final_extension,
-                        digest,
-                        job_id or uuid.uuid4().hex,
-                    )
-                except StorageUnavailable as exc:
-                    raise ApiError(507, "storage_unavailable", str(exc)) from exc
-                placement_path = placement.path
+                    existing_path = self.storage.track_path(existing)
+                except StorageUnavailable:
+                    existing_path = None
+                if existing_path is not None and existing_path.is_file() and existing.available:
+                    placement_path.unlink(missing_ok=True)
+                    placement_path = None
+                    db.expunge(existing)
+                    db.rollback()
+                    return existing, True
                 old_location = (existing.storage_id, existing.storage_name)
                 existing.storage_id = placement.storage_id
                 existing.storage_name = placement.storage_name
@@ -475,18 +498,7 @@ class MediaService:
                         self.storage.delete(*old_location)
                 return existing, True
 
-            if status_callback:
-                status_callback("placing")
-            try:
-                placement = self.storage.place(
-                    retained_path,
-                    final_extension,
-                    digest,
-                    job_id or uuid.uuid4().hex,
-                )
-            except StorageUnavailable as exc:
-                raise ApiError(507, "storage_unavailable", str(exc)) from exc
-            placement_path = placement.path
+            db.rollback()
             cover_name = self._write_cover(metadata)
             now = utcnow()
             track = Track(
@@ -523,6 +535,8 @@ class MediaService:
                     cover_name = None
                 winner = db.scalar(select(Track).where(Track.sha256 == digest))
                 if winner is not None:
+                    db.expunge(winner)
+                    db.rollback()
                     return winner, True
                 raise
             db.refresh(track)

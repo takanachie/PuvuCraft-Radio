@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from backend.app.models import Channel, Track
 
@@ -185,6 +186,51 @@ def test_hls_is_protected_and_authorized_by_channel(initialized_admin: TestClien
     )
     assert internal_file.status_code == 403
     assert client.get("/api/internal/admin-auth").status_code == 204
+
+
+def test_hls_authorization_reuses_bounded_session_and_channel_caches(
+    initialized_admin: TestClient,
+) -> None:
+    client = initialized_admin
+    _mark_hls_ready_without_ffmpeg(client)
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many) -> None:
+        statements.append(statement)
+
+    event.listen(client.app.state.database.engine, "before_cursor_execute", record_statement)
+    try:
+        for path in ("/hls/default/index.m3u8", "/hls/default/g1-seg-1.ts"):
+            response = client.get(
+                "/api/internal/stream-auth",
+                headers={"X-Original-URI": path},
+            )
+            assert response.status_code == 204
+    finally:
+        event.remove(client.app.state.database.engine, "before_cursor_execute", record_statement)
+
+    session_reads = [sql for sql in statements if "FROM sessions" in sql]
+    channel_reads = [sql for sql in statements if "FROM channels" in sql]
+    assert len(session_reads) == 1, statements
+    assert channel_reads == []
+
+
+def test_logout_immediately_invalidates_hls_authorization_cache(
+    initialized_admin: TestClient,
+) -> None:
+    client = initialized_admin
+    _mark_hls_ready_without_ffmpeg(client)
+    headers = {"X-Original-URI": "/hls/default/index.m3u8"}
+    session_cookie = client.cookies["radio_session"]
+    assert client.get("/api/internal/stream-auth", headers=headers).status_code == 204
+    assert client.post("/api/auth/logout", headers=csrf_headers(client)).status_code == 204
+    assert (
+        client.get(
+            "/api/internal/stream-auth",
+            headers={**headers, "Cookie": f"radio_session={session_cookie}"},
+        ).status_code
+        == 401
+    )
 
 
 def test_hls_activity_is_exposed_as_current_listener_status(

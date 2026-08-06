@@ -40,6 +40,16 @@ def test_seed_channel_slug_cannot_escape_hls_root(settings: Settings) -> None:
         Settings.model_validate(payload)
 
 
+def test_production_sqlite_requires_wal(settings: Settings) -> None:
+    payload = settings.model_dump()
+    payload["app"]["environment"] = "production"
+    payload["app"]["public_base_url"] = "https://radio.example.com"
+    payload["auth"]["session"]["secure_cookie"] = True
+    payload["database"]["sqlite_wal"] = False
+    with pytest.raises(ValidationError, match="requires WAL mode"):
+        Settings.model_validate(payload)
+
+
 def test_upload_queue_limit_is_fixed_at_twenty(settings: Settings) -> None:
     payload = settings.model_dump()
     payload["uploads"]["queue_limit"] = 21
@@ -77,6 +87,31 @@ def test_storage_location_ids_must_be_unique(settings: Settings) -> None:
     payload["storage"]["locations"].append(payload["storage"]["locations"][0].copy())
     with pytest.raises(ValidationError):
         Settings.model_validate(payload)
+
+
+def test_sqlite_runtime_is_durable_and_memory_bounded(settings: Settings) -> None:
+    database = Database(settings)
+    try:
+        database.initialize()
+        with database.engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA journal_mode").scalar_one() == "wal"
+            assert connection.exec_driver_sql("PRAGMA synchronous").scalar_one() == 2
+            assert (
+                connection.exec_driver_sql("PRAGMA mmap_size").scalar_one()
+                == settings.database.sqlite_mmap_size_bytes
+            )
+            assert (
+                connection.exec_driver_sql("PRAGMA cache_size").scalar_one()
+                == -settings.database.sqlite_cache_size_kib
+            )
+            assert (
+                connection.exec_driver_sql("PRAGMA journal_size_limit").scalar_one()
+                == settings.database.sqlite_journal_size_limit_bytes
+            )
+        assert database.engine.pool.size() == settings.database.pool_size
+        assert database.engine.pool._max_overflow == 0
+    finally:
+        database.close()
 
 
 def test_production_startup_refuses_an_unmigrated_database(settings: Settings) -> None:

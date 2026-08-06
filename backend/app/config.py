@@ -53,6 +53,16 @@ class PathsConfig(StrictModel):
 class DatabaseConfig(StrictModel):
     url: str
     sqlite_wal: bool = True
+    sqlite_synchronous: Literal["NORMAL", "FULL"] = "FULL"
+    sqlite_mmap_size_bytes: int = Field(default=64 * 1024 * 1024, ge=0, le=1024 * 1024 * 1024)
+    sqlite_cache_size_kib: int = Field(default=2048, ge=256, le=64 * 1024)
+    sqlite_journal_size_limit_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=1024 * 1024 * 1024,
+    )
+    pool_size: int = Field(default=2, ge=1, le=8)
+    pool_timeout_seconds: int = Field(default=5, ge=1, le=60)
     busy_timeout_ms: int = Field(default=5000, ge=0)
 
 
@@ -342,6 +352,8 @@ class Settings(StrictModel):
                 raise ValueError("production requires auth.session.secure_cookie=true")
             if not self.app.public_base_url.startswith("https://"):
                 raise ValueError("production public_base_url must use HTTPS")
+            if self.database.url.startswith("sqlite:") and not self.database.sqlite_wal:
+                raise ValueError("production SQLite requires WAL mode")
         if self.stream_access.allow_anonymous or not self.streaming.require_authenticated_session:
             raise ValueError("anonymous streaming is outside the v1 specification")
         return self
