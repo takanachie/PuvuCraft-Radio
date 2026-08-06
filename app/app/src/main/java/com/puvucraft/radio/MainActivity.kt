@@ -85,6 +85,11 @@ class MainActivity : ComponentActivity() {
                 onSelectChannel = radioViewModel::selectChannel,
                 onStreamFormatChange = radioViewModel::selectStreamFormat,
                 onListen = radioViewModel::requestPlayback,
+                onForceReconnect = { channelId ->
+                    playback.forceDisconnect {
+                        radioViewModel.forceReconnect(channelId)
+                    }
+                },
                 onTogglePlayback = playback::toggle,
                 onVolumeChange = playback::setVolume,
                 onToggleMute = playback::toggleMute,

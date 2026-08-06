@@ -229,18 +229,35 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestPlayback(channelId: Long) {
-        val channel = _state.value.channels.firstOrNull { it.id == channelId } ?: return
+        preparePlayback(channelId, forceReconnect = false)
+    }
+
+    fun forceReconnect(channelId: Long) {
+        preparePlayback(channelId, forceReconnect = true)
+    }
+
+    private fun preparePlayback(
+        channelId: Long,
+        forceReconnect: Boolean,
+    ) {
+        val snapshot = _state.value
+        val channel = snapshot.channels.firstOrNull { it.id == channelId } ?: return
         val client = api ?: return
-        if (_state.value.isPreparingStream) return
+        if (snapshot.isPreparingStream) return
+
+        _state.update {
+            it.copy(
+                isPreparingStream = true,
+                error = null,
+                notice = if (forceReconnect) {
+                    "正在重新认证并建立直播连接…"
+                } else {
+                    "正在建立直播连接…"
+                },
+            )
+        }
 
         viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    isPreparingStream = true,
-                    error = null,
-                    notice = "正在建立直播连接…",
-                )
-            }
             try {
                 val key = client.playerKey()
                 val streamFormat = allowedStreamFormat(
@@ -263,7 +280,12 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     return@launch
                 }
-                issuePlayback(client, channel, streamFormat)
+                issuePlayback(
+                    client,
+                    channel,
+                    streamFormat,
+                    forceReconnect = forceReconnect,
+                )
             } catch (error: Exception) {
                 when {
                     error.isUnauthorized() -> expireSession()
@@ -363,6 +385,7 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
         client: RadioApiClient,
         channel: RadioChannel,
         streamFormat: PlayerStreamFormat,
+        forceReconnect: Boolean = false,
     ) {
         val ticket = client.createStreamTicket(channel.id, streamFormat)
         _events.emit(
@@ -379,9 +402,13 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
         _state.update {
             it.copy(
                 isPreparingStream = false,
-                notice = when (ticket.streamFormat) {
-                    PlayerStreamFormat.AAC -> "AAC 320 kbps 直播连接已建立"
-                    PlayerStreamFormat.FLAC -> "FLAC 无损直播连接已建立"
+                notice = when {
+                    forceReconnect && ticket.streamFormat == PlayerStreamFormat.AAC ->
+                        "已重新认证并建立 AAC 320 kbps 直播连接"
+                    forceReconnect -> "已重新认证并建立 FLAC 无损直播连接"
+                    ticket.streamFormat == PlayerStreamFormat.AAC ->
+                        "AAC 320 kbps 直播连接已建立"
+                    else -> "FLAC 无损直播连接已建立"
                 },
             )
         }

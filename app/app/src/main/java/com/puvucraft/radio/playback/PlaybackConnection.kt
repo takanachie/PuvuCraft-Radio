@@ -152,17 +152,14 @@ class PlaybackConnection(context: Context) {
 
     fun stopAndClear() {
         mainExecutor.execute {
-            pendingPlayback = null
-            controller?.run {
-                stop()
-                clearMediaItems()
-                updateState(this)
-            }
-            if (controller == null) {
-                _state.value = PlaybackUiState(
-                    volumeLevel = volumeStore.readLevel(),
-                )
-            }
+            disconnectNow()
+        }
+    }
+
+    fun forceDisconnect(onDisconnected: () -> Unit) {
+        mainExecutor.execute {
+            disconnectNow()
+            onDisconnected()
         }
     }
 
@@ -204,6 +201,30 @@ class PlaybackConnection(context: Context) {
         activeController.prepare()
         activeController.play()
         updateState(activeController)
+    }
+
+    private fun disconnectNow() {
+        pendingPlayback = null
+        controller?.run {
+            stop()
+            clearMediaItems()
+            updateState(this)
+        }
+        if (controller == null) {
+            _state.value = PlaybackUiState(
+                volumeLevel = volumeStore.readLevel(),
+            )
+            return
+        }
+        _state.value = _state.value.copy(
+            hasMedia = false,
+            channelId = null,
+            channelName = null,
+            streamFormat = null,
+            isPlaying = false,
+            isBuffering = false,
+            error = null,
+        )
     }
 
     private fun updateState(player: Player) {

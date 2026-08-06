@@ -95,6 +95,7 @@ fun PuvuRadioApp(
     onSelectChannel: (Long) -> Unit,
     onStreamFormatChange: (PlayerStreamFormat) -> Unit,
     onListen: (Long) -> Unit,
+    onForceReconnect: (Long) -> Unit,
     onTogglePlayback: () -> Unit,
     onVolumeChange: (Float) -> Unit,
     onToggleMute: () -> Unit,
@@ -120,6 +121,7 @@ fun PuvuRadioApp(
                     onSelectChannel = onSelectChannel,
                     onStreamFormatChange = onStreamFormatChange,
                     onListen = onListen,
+                    onForceReconnect = onForceReconnect,
                     onTogglePlayback = onTogglePlayback,
                     onVolumeChange = onVolumeChange,
                     onToggleMute = onToggleMute,
@@ -435,6 +437,7 @@ private fun ListenerScreen(
     onSelectChannel: (Long) -> Unit,
     onStreamFormatChange: (PlayerStreamFormat) -> Unit,
     onListen: (Long) -> Unit,
+    onForceReconnect: (Long) -> Unit,
     onTogglePlayback: () -> Unit,
     onVolumeChange: (Float) -> Unit,
     onToggleMute: () -> Unit,
@@ -516,6 +519,7 @@ private fun ListenerScreen(
                             losslessAvailable = state.losslessAvailable,
                             onStreamFormatChange = onStreamFormatChange,
                             onListen = onListen,
+                            onForceReconnect = onForceReconnect,
                             onTogglePlayback = onTogglePlayback,
                             onVolumeChange = onVolumeChange,
                             onToggleMute = onToggleMute,
@@ -536,6 +540,7 @@ private fun ListenerScreen(
                         losslessAvailable = state.losslessAvailable,
                         onStreamFormatChange = onStreamFormatChange,
                         onListen = onListen,
+                        onForceReconnect = onForceReconnect,
                         onTogglePlayback = onTogglePlayback,
                         onVolumeChange = onVolumeChange,
                         onToggleMute = onToggleMute,
@@ -821,6 +826,7 @@ private fun PlayerConsole(
     losslessAvailable: Boolean,
     onStreamFormatChange: (PlayerStreamFormat) -> Unit,
     onListen: (Long) -> Unit,
+    onForceReconnect: (Long) -> Unit,
     onTogglePlayback: () -> Unit,
     onVolumeChange: (Float) -> Unit,
     onToggleMute: () -> Unit,
@@ -858,6 +864,7 @@ private fun PlayerConsole(
                         losslessAvailable = losslessAvailable,
                         onStreamFormatChange = onStreamFormatChange,
                         onListen = onListen,
+                        onForceReconnect = onForceReconnect,
                         onTogglePlayback = onTogglePlayback,
                         onVolumeChange = onVolumeChange,
                         onToggleMute = onToggleMute,
@@ -895,6 +902,7 @@ private fun PlayerConsole(
                         losslessAvailable = losslessAvailable,
                         onStreamFormatChange = onStreamFormatChange,
                         onListen = onListen,
+                        onForceReconnect = onForceReconnect,
                         onTogglePlayback = onTogglePlayback,
                         onVolumeChange = onVolumeChange,
                         onToggleMute = onToggleMute,
@@ -1032,6 +1040,7 @@ private fun TransportDeck(
     losslessAvailable: Boolean,
     onStreamFormatChange: (PlayerStreamFormat) -> Unit,
     onListen: (Long) -> Unit,
+    onForceReconnect: (Long) -> Unit,
     onTogglePlayback: () -> Unit,
     onVolumeChange: (Float) -> Unit,
     onToggleMute: () -> Unit,
@@ -1132,6 +1141,16 @@ private fun TransportDeck(
                     else -> "开始收听"
                 },
             )
+        }
+
+        OutlinedButton(
+            onClick = {
+                channel?.let { onForceReconnect(it.id) }
+            },
+            enabled = currentChannel && playbackState.hasMedia && !isPreparing,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("↻ 强制断线重连")
         }
 
         OutlinedButton(
@@ -1591,6 +1610,7 @@ private fun LoginPhonePreview() {
         onSelectChannel = {},
         onStreamFormatChange = {},
         onListen = {},
+        onForceReconnect = {},
         onTogglePlayback = {},
         onVolumeChange = {},
         onToggleMute = {},
@@ -1650,6 +1670,7 @@ private fun ListenerTabletPreview() {
         onSelectChannel = {},
         onStreamFormatChange = {},
         onListen = {},
+        onForceReconnect = {},
         onTogglePlayback = {},
         onVolumeChange = {},
         onToggleMute = {},
