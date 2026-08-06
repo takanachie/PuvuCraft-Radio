@@ -10,7 +10,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1041,7 +1041,7 @@ class ChannelSupervisor:
                 position = selection.offset_seconds + bytes_written / self._pcm_bytes_per_second
                 checkpoint_interval = self.settings.streaming.playback.state_checkpoint_seconds
                 if time.monotonic() - last_checkpoint >= checkpoint_interval:
-                    self._checkpoint(position)
+                    await self._checkpoint(position)
                     last_checkpoint = time.monotonic()
                 try:
                     chunk = await asyncio.wait_for(
@@ -1060,7 +1060,7 @@ class ChannelSupervisor:
             if self._stopping.is_set():
                 history_reason = "stopped"
             await self._stop_decoder()
-            self._finish_history(history_reason)
+            await asyncio.to_thread(self._finish_history, history_reason)
 
     @staticmethod
     async def _write_pcm(
@@ -1427,9 +1427,18 @@ class ChannelSupervisor:
         )
         return history_id
 
-    def _checkpoint(self, position: float) -> None:
+    async def _checkpoint(self, position: float) -> None:
         now = utcnow()
         position = max(0, position)
+        await asyncio.to_thread(self._persist_checkpoint, position, now)
+        self._publish_snapshot(
+            status="live",
+            position_seconds=position,
+            server_time=iso(now),
+            started_at=iso(now),
+        )
+
+    def _persist_checkpoint(self, position: float, now: datetime) -> None:
         with self.database.session_factory.begin() as db:
             db.execute(
                 update(PlaybackState)
@@ -1441,12 +1450,6 @@ class ChannelSupervisor:
                     updated_at=now,
                 )
             )
-        self._publish_snapshot(
-            status="live",
-            position_seconds=position,
-            server_time=iso(now),
-            started_at=iso(now),
-        )
 
     def _finish_history(self, reason: str) -> None:
         history_id, self._history_id = self._history_id, None

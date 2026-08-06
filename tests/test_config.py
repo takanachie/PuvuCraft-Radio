@@ -109,7 +109,7 @@ def test_sqlite_runtime_is_durable_and_memory_bounded(settings: Settings) -> Non
                 == settings.database.sqlite_journal_size_limit_bytes
             )
         assert database.engine.pool.size() == settings.database.pool_size
-        assert database.engine.pool._max_overflow == 0
+        assert database.engine.pool._max_overflow == settings.database.pool_max_overflow
     finally:
         database.close()
 

@@ -52,6 +52,26 @@ def _plain_status(status_code: int) -> Response:
     )
 
 
+def _resolve_external_player(
+    request: Request,
+    stream_format: str,
+    player_key: str,
+    channel_slug: str,
+) -> tuple[int, int, tuple[int, bytes]] | int:
+    token_service: PlayerTokenService = request.app.state.player_tokens
+    with request.app.state.database.session_factory() as db:
+        try:
+            validated = token_service.validate(db, player_key)
+        except InvalidPlayerToken:
+            return 404
+        if stream_format == "flac" and validated.user.role != "admin":
+            return 404
+        channel = db.scalar(select(Channel).where(Channel.slug == channel_slug))
+        if channel is None or not channel.enabled:
+            return 503
+        return validated.user.id, channel.id, validated.identity
+
+
 def _player_key_state(
     user: User,
     token_service: PlayerTokenService,
@@ -82,7 +102,7 @@ def get_player_key(
 def regenerate_player_key(
     request: Request,
     user: User = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     initialize_player_credential(user)
     user.updated_at = utcnow()
@@ -97,7 +117,7 @@ def create_player_url(
     payload: PlayerUrlInput,
     request: Request,
     user: User = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
     token_service: PlayerTokenService = request.app.state.player_tokens
@@ -206,20 +226,16 @@ async def external_player_stream(
     if stream_format not in {"aac", "flac"}:
         return _plain_status(404)
 
-    token_service: PlayerTokenService = request.app.state.player_tokens
-    with request.app.state.database.session_factory() as db:
-        try:
-            validated = token_service.validate(db, player_key)
-        except InvalidPlayerToken:
-            return _plain_status(404)
-        if stream_format == "flac" and validated.user.role != "admin":
-            return _plain_status(404)
-        channel = db.scalar(select(Channel).where(Channel.slug == channel_slug))
-        if channel is None or not channel.enabled:
-            return _plain_status(503)
-        user_id = validated.user.id
-        channel_id = channel.id
-        identity = validated.identity
+    resolved = await asyncio.to_thread(
+        _resolve_external_player,
+        request,
+        stream_format,
+        player_key,
+        channel_slug,
+    )
+    if isinstance(resolved, int):
+        return _plain_status(resolved)
+    user_id, channel_id, identity = resolved
 
     subscription: AudioSubscription | None = None
     try:

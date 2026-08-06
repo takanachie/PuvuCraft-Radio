@@ -61,7 +61,8 @@ class DatabaseConfig(StrictModel):
         ge=1024 * 1024,
         le=1024 * 1024 * 1024,
     )
-    pool_size: int = Field(default=2, ge=1, le=8)
+    pool_size: int = Field(default=5, ge=1, le=16)
+    pool_max_overflow: int = Field(default=10, ge=0, le=32)
     pool_timeout_seconds: int = Field(default=5, ge=1, le=60)
     busy_timeout_ms: int = Field(default=5000, ge=0)
 

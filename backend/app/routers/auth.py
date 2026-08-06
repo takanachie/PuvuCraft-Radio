@@ -47,7 +47,7 @@ def _validate_unique_user(db: Session, username: str, email: str) -> None:
 
 
 @router.get("/setup/status")
-def setup_status(db: Session = Depends(get_db)) -> dict[str, bool]:
+def setup_status(db: Session = Depends(get_db, scope="function")) -> dict[str, bool]:
     required = not bool(db.scalar(select(User.id).where(User.role == "admin").limit(1)))
     return {"required": required}
 
@@ -56,7 +56,7 @@ def setup_status(db: Session = Depends(get_db)) -> dict[str, bool]:
 def create_first_admin(
     payload: SetupInput,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     auth: AuthService = Depends(get_auth),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
@@ -102,7 +102,7 @@ def create_first_admin(
 def register(
     payload: RegistrationInput,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     auth: AuthService = Depends(get_auth),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
@@ -149,7 +149,7 @@ def login(
     payload: LoginInput,
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     auth: AuthService = Depends(get_auth),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
@@ -188,7 +188,7 @@ def logout(
     request: Request,
     response: Response,
     login_session: LoginSession = Depends(get_login_session),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     auth: AuthService = Depends(get_auth),
 ) -> Response:
     auth.verify_csrf(request, login_session)

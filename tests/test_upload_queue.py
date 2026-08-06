@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import timedelta
 
@@ -12,6 +13,7 @@ from backend.app.dependencies import get_db
 from backend.app.main import create_app
 from backend.app.models import AuditEvent, MusicLibrary, Track, UploadJob, utcnow
 from backend.app.routers import uploads as upload_routes
+from backend.app.services.uploads import UploadManager
 
 from .conftest import csrf_headers
 
@@ -23,6 +25,24 @@ def _dependency_calls(dependant) -> set[object]:
     for dependency in dependant.dependencies:
         calls.update(_dependency_calls(dependency))
     return calls
+
+
+def _dependency_nodes(dependant):
+    yield dependant
+    for dependency in dependant.dependencies:
+        yield from _dependency_nodes(dependency)
+
+
+def _api_routes(routes):
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        nested = getattr(route, "routes", None)
+        if nested is None:
+            original_router = getattr(route, "original_router", None)
+            nested = getattr(original_router, "routes", None)
+        if nested is not None:
+            yield from _api_routes(nested)
 
 
 def _reserve(
@@ -72,6 +92,35 @@ def test_upload_routes_do_not_hold_request_scoped_database_sessions() -> None:
         assert get_db not in _dependency_calls(route.dependant), route.path
 
 
+def test_database_sessions_close_before_response_body(settings) -> None:
+    app = create_app(settings)
+    try:
+        database_dependencies = [
+            dependency
+            for route in _api_routes(app.routes)
+            for dependency in _dependency_nodes(route.dependant)
+            if dependency.call is get_db
+        ]
+        assert database_dependencies
+        assert all(dependency.scope == "function" for dependency in database_dependencies)
+    finally:
+        app.state.database.close()
+
+
+async def test_upload_scheduler_database_wait_does_not_block_event_loop(monkeypatch) -> None:
+    manager = object.__new__(UploadManager)
+
+    def slow_database_work() -> bool:
+        time.sleep(0.15)
+        return False
+
+    monkeypatch.setattr(manager, "_schedule_once_sync", slow_database_work)
+    task = asyncio.create_task(manager._schedule_once())
+    await asyncio.sleep(0.02)
+    assert not task.done()
+    await task
+
+
 def test_upload_heartbeat_succeeds_with_a_single_database_connection(
     settings,
     monkeypatch,
@@ -116,6 +165,12 @@ def test_upload_heartbeat_succeeds_with_a_single_database_connection(
             json={"client_id": CLIENT_ID},
         )
         assert response.status_code == 204, response.text
+        deadline = time.monotonic() + 1
+        while (
+            client.app.state.database.engine.pool.checkedout() != 0
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         assert client.app.state.database.engine.pool.checkedout() == 0
 
 

@@ -649,6 +649,11 @@ class UploadManager:
                 await asyncio.wait_for(self._wake.wait(), timeout=1)
 
     async def _schedule_once(self) -> None:
+        changed = await asyncio.to_thread(self._schedule_once_sync)
+        if changed:
+            self._publish_snapshot()
+
+    def _schedule_once_sync(self) -> bool:
         changed = False
         abandoned_temp_names: list[str] = []
         now = utcnow()
@@ -708,8 +713,7 @@ class UploadManager:
                 changed = True
         for temp_name in abandoned_temp_names:
             self._temp_path(temp_name).unlink(missing_ok=True)
-        if changed:
-            self._publish_snapshot()
+        return changed
 
     def _request_upload_cancel(self, job_id: str) -> None:
         upload_task = self._upload_tasks.get(job_id)

@@ -134,7 +134,7 @@ def offline_listener_state() -> dict[str, object]:
 def list_users(
     request: Request,
     _admin: User = Depends(require_admin_read),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     latest_activity = (
         select(func.max(LoginSession.last_seen_at))
@@ -160,7 +160,7 @@ def list_users(
 def list_current_listeners(
     request: Request,
     _admin: User = Depends(require_admin_read),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     states = current_listener_states(request, db)
     return [
@@ -179,7 +179,7 @@ def update_user(
     payload: UserUpdate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     user = db.get(User, user_id)
     if user is None:
@@ -225,7 +225,7 @@ def update_user_role(
     payload: UserRoleUpdate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     user = db.get(User, user_id)
     if user is None:
@@ -263,7 +263,7 @@ def delete_user(
     user_id: int,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> None:
     user = db.get(User, user_id)
     if user is None:
@@ -313,7 +313,7 @@ def delete_user(
 def admin_channels(
     request: Request,
     _admin: User = Depends(require_admin_read),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     channels = db.scalars(
         select(Channel)
@@ -332,7 +332,7 @@ def create_channel(
     payload: ChannelCreate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     channel = Channel(**payload.model_dump(), created_at=utcnow(), updated_at=utcnow())
     channel.playback_state = PlaybackState(status="starting" if channel.enabled else "stopped")
@@ -366,7 +366,7 @@ def update_channel(
     payload: ChannelUpdate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     channel = db.get(Channel, channel_id)
     if channel is None:
@@ -412,7 +412,7 @@ def delete_channel(
     channel_id: int,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> None:
     channel = db.get(Channel, channel_id)
     if channel is None:
@@ -461,7 +461,7 @@ def _music_library_dict(db: Session, library: MusicLibrary) -> dict[str, object]
 @router.get("/track-libraries")
 def list_music_libraries(
     _admin: User = Depends(require_admin_read),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     libraries = db.scalars(
         select(MusicLibrary).order_by(MusicLibrary.name.asc())
@@ -474,7 +474,7 @@ def list_music_libraries(
 def create_music_library(
     payload: MusicLibraryCreate,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     if db.get(MusicLibrary, payload.name) is not None:
         raise ApiError(409, "music_library_exists", "同名音乐库已经存在")
@@ -502,7 +502,7 @@ def rename_music_library(
     payload: MusicLibraryUpdate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     library = db.get(MusicLibrary, library_name)
     if library is None:
@@ -551,7 +551,7 @@ def delete_music_library(
     library_name: str,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> None:
     library = db.get(MusicLibrary, library_name)
     if library is None:
@@ -609,7 +609,7 @@ def list_tracks(
     exclude_channel_id: int | None = Query(default=None, ge=1),
     include_matching_ids: bool = Query(default=False),
     _admin: User = Depends(require_admin_read),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     if db.get(MusicLibrary, library_group) is None:
         raise ApiError(404, "music_library_not_found", "音乐库不存在")
@@ -687,7 +687,7 @@ def list_tracks(
 def scan_tracks(
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     result = request.app.state.media.scan(db)
     audit(
@@ -708,7 +708,7 @@ def scan_tracks(
 def move_tracks_to_library(
     payload: TrackLibraryBatchMove,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     if payload.source_library == payload.target_library:
         raise ApiError(409, "same_track_library", "源音乐库与目标音乐库不能相同")
@@ -768,7 +768,7 @@ def update_track(
     payload: TrackUpdate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     track = db.scalar(
         select(Track)
@@ -804,7 +804,7 @@ def upload_track_cover(
     file: UploadFile,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
     track = db.scalar(
@@ -856,7 +856,7 @@ def delete_track(
     track_id: int,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     settings: Settings = Depends(get_settings),
 ) -> None:
     track = db.scalar(
@@ -918,7 +918,7 @@ def _playlist_changed(request: Request, channel: Channel) -> None:
 def admin_playlist(
     channel_id: int,
     _admin: User = Depends(require_admin_read),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     return _playlist_response(db, _get_channel(db, channel_id))
 
@@ -929,7 +929,7 @@ def add_playlist_item(
     payload: PlaylistAdd,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     channel = _get_channel(db, channel_id)
     track = db.get(Track, payload.track_id)
@@ -961,7 +961,7 @@ def add_playlist_items(
     payload: PlaylistBatchAdd,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     channel = _get_channel(db, channel_id)
     existing_track_ids = set(
@@ -1044,7 +1044,7 @@ def update_playlist_item(
     payload: PlaylistItemUpdate,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     channel = _get_channel(db, channel_id)
     item = db.scalar(
@@ -1074,7 +1074,7 @@ def remove_playlist_item(
     item_id: int,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> None:
     channel = _get_channel(db, channel_id)
     item = db.scalar(
@@ -1104,7 +1104,7 @@ def reorder_playlist(
     payload: PlaylistReorder,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     channel = _get_channel(db, channel_id)
     items = _playlist(db, channel_id)
@@ -1135,7 +1135,7 @@ def skip_channel(
     channel_id: int,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, str]:
     channel = _get_channel(db, channel_id)
     if not channel.enabled:
@@ -1154,7 +1154,7 @@ def play_now(
     item_id: int,
     request: Request,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, str]:
     channel = _get_channel(db, channel_id)
     if not channel.enabled:

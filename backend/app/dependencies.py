@@ -25,7 +25,7 @@ def get_auth(request: Request) -> AuthService:
 
 def get_login_session(
     request: Request,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     auth: AuthService = Depends(get_auth),
 ) -> LoginSession:
     return auth.authenticate_request(request, db)

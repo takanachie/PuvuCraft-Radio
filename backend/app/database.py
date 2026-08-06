@@ -25,7 +25,7 @@ class Database:
             connect_args["check_same_thread"] = False
             engine_options.update(
                 pool_size=settings.database.pool_size,
-                max_overflow=0,
+                max_overflow=settings.database.pool_max_overflow,
                 pool_timeout=settings.database.pool_timeout_seconds,
                 pool_use_lifo=True,
             )

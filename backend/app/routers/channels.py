@@ -44,11 +44,16 @@ def _enabled_channel(db: Session, channel_id: int) -> Channel:
     return channel
 
 
+def _validate_event_channel(request: Request, channel_id: int) -> None:
+    with request.app.state.database.session_factory() as db:
+        _enabled_channel(db, channel_id)
+
+
 @router.get("/api/channels")
 def list_channels(
     request: Request,
     _user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     channels = db.scalars(
         select(Channel)
@@ -65,7 +70,7 @@ def get_channel(
     channel_id: int,
     request: Request,
     _user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict[str, object]:
     channel = _enabled_channel(db, channel_id)
     return channel_dict(db, channel, request.app.state.playback.snapshot(channel.id))
@@ -75,7 +80,7 @@ def get_channel(
 def get_playlist(
     channel_id: int,
     _user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> list[dict[str, object]]:
     channel = _enabled_channel(db, channel_id)
     items = (
@@ -99,8 +104,7 @@ async def channel_events(
     _session_id: int = Depends(authenticate_once),
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
-    with request.app.state.database.session_factory() as db:
-        _enabled_channel(db, channel_id)
+    await asyncio.to_thread(_validate_event_channel, request, channel_id)
     manager = request.app.state.playback
 
     async def stream():
@@ -127,11 +131,10 @@ async def channel_events(
                     timed_out = True
                     payload = {}
                 if time.monotonic() >= next_auth_check:
-                    with request.app.state.database.session_factory() as session_db:
-                        try:
-                            request.app.state.auth.authenticate_request(request, session_db)
-                        except ApiError:
-                            break
+                    try:
+                        await asyncio.to_thread(authenticate_once, request)
+                    except ApiError:
+                        break
                     next_auth_check = time.monotonic() + auth_interval
                 if timed_out:
                     yield _sse("heartbeat", {"type": "heartbeat", "server_time": iso(utcnow())})
